@@ -273,7 +273,7 @@ command = ["uv", "cache", "prune"]
 every = "24h"
 when_free_below = "80GB"  # optional; free space on the home volume, strictly below
 timeout = "20m"          # optional; default 20m, must be a positive duration
-in_use = { lockfiles = ["~/.cache/uv/.lock"], lsof = ["~/.cache/uv"], processes = ["uv"] }
+# No in_use: uv cache prune takes uv's own cache lock.
 
 [[maintenance]]
 name = "npm"
@@ -291,7 +291,7 @@ in_use = { processes = ["pnpm"] }
 name = "brew"
 command = ["brew", "cleanup"]
 every = "7d"
-in_use = { processes = ["brew"] }
+# No in_use: brew cleanup uses its own locking.
 
 [[maintenance]]
 name = "docker-dangling"
@@ -313,9 +313,19 @@ maintenance = []         # replaces the global list; [] disables all hooks here
 Host sections may override `maintenance_armed` and replace the entire
 `maintenance` list, using `[[hosts.worker.maintenance]]` for host entries. Names
 must be unique within the effective host list. Cache locations vary by tool and
-host; declare the paths and exact process names used there. The Docker example
+host; declare checks only where the tool needs them. The Docker example
 prunes dangling images only; it does not prune containers, volumes or all unused
 images. No example command is executed by installing or building this tool.
+
+`in_use` is optional; omitting it runs no lockfile, lsof or process probes.
+Tools with their own cache locking, such as `uv cache prune` and `brew cleanup`,
+should omit process-name checks and rely on their native locks. A long-running
+`uv` process is common on development machines and does not mean its cache is
+unavailable for pruning. For tools that need external checks, for example:
+
+```toml
+in_use = { lockfiles = ["~/.cache/mytool/cleanup.lock"], lsof = ["~/.cache/mytool"], processes = ["mytool"] }
+```
 
 Any declared lockfile's existence (including a stale file or dangling symlink)
 skips cleanup. An error checking a lockfile also skips it. `lsof +D` must return

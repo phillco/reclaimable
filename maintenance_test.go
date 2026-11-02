@@ -125,6 +125,23 @@ func TestMaintenanceInUse(t *testing.T) {
 		}
 	}
 }
+func TestMaintenanceWithoutInUse(t *testing.T) {
+	e, bin := maintenanceFixture(t)
+	config := fmt.Sprintf(`maintenance_armed = true
+[[maintenance]]
+name = "fixture"
+command = ["fixture-clean", %q]
+every = "24h"
+`, e.Cfg.Maintenance[0].Command[1])
+	must(t, atomicWrite(e.A.ConfigFile, []byte(config), 0600))
+	cfg, err := e.A.loadConfig(e.A.ConfigFile)
+	must(t, err)
+	e.Cfg = cfg
+	// No external probes are available; an omitted in_use must not need them.
+	t.Setenv("PATH", bin)
+	rows, failed := maintenanceRun(t, e, Args{})
+	check(t, !failed && rows[0].Status == "success" && exists(e.Cfg.Maintenance[0].Command[1]), "hook without in_use did not run: %+v", rows)
+}
 func TestMaintenanceGuardErrors(t *testing.T) {
 	for _, probe := range []string{"lsof", "pgrep"} {
 		for _, output := range []string{"echo unexpected", "echo warning >&2", "sleep 1"} {
