@@ -145,6 +145,67 @@ func TestMaintenanceRejectsRelativeBusyExecutable(t *testing.T) {
 	check(t, err != nil, "relative busy executable accepted")
 }
 
+func TestMaintenanceConfigDirExecutables(t *testing.T) {
+	for _, load := range []bool{false, true} {
+		t.Run(fmt.Sprintf("load=%t", load), func(t *testing.T) {
+			e, _ := maintenanceFixture(t)
+			must(t, os.MkdirAll(e.A.ConfigDir, 0755))
+			fakeExecutable(t, e.A.ConfigDir, "fixture-clean", "printf '%s\\n' \"$@\" > \"$1\"\n")
+			fakeExecutable(t, e.A.ConfigDir, "fixture-busy", "printf '%s\\n' \"$2\" > \"$1\"\nexit 1\n")
+			sentinel, probe := filepath.Join(e.Root, "clean-argv"), filepath.Join(e.Root, "busy-owner")
+			cmd := []string{"{config_dir}/fixture-clean", sentinel, "{folder}", "~/literal"}
+			holder := map[string]any{"name": "busy", "command": []string{"{config_dir}/fixture-busy", probe, "{owner}"}}
+			if load {
+				config := fmt.Sprintf("roots = [%q]\nmaintenance_armed = true\n[[maintenance]]\nname = 'fixture'\ncommand = [%q, %q, '{folder}', '~/literal']\nevery = '1h'\nbusy_holders = ['busy']\n[[holder]]\nname = 'busy'\ncommand = [%q, %q, '{owner}']\n", e.Root, cmd[0], sentinel, "{config_dir}/fixture-busy", probe)
+				must(t, atomicWrite(e.A.ConfigFile, []byte(config), 0600))
+				var err error
+				e.Cfg, err = e.A.loadConfig(e.A.ConfigFile)
+				must(t, err)
+			} else {
+				e.Cfg.Maintenance[0].Command = cmd
+				e.Cfg.Maintenance[0].BusyHolders = []map[string]any{holder}
+			}
+			rows, failed := maintenanceRun(t, e, Args{})
+			check(t, !failed && rows[0].Status == "success", "config-local commands refused: %+v", rows)
+			output, err := os.ReadFile(sentinel)
+			must(t, err)
+			check(t, string(output) == sentinel+"\n{folder}\n~/literal\n", "maintenance arguments unexpectedly expanded: %q", output)
+			output, err = os.ReadFile(probe)
+			must(t, err)
+			check(t, string(output) == "fixture\n", "busy holder arguments lost expansion: %q", output)
+		})
+	}
+}
+
+func TestMaintenanceConfigDirDoesNotPermitRelativePaths(t *testing.T) {
+	for _, executable := range []string{"./helper", "bin/helper", "~/{config_dir}/helper", "prefix/{config_dir}/helper", "{folder}/helper", "{owner}/helper"} {
+		for _, busy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/busy=%t", executable, busy), func(t *testing.T) {
+				e, _ := maintenanceFixture(t)
+				command, holderCommand := executable, "fixture-busy"
+				if busy {
+					command, holderCommand = "fixture-clean", executable
+				}
+				config := fmt.Sprintf("roots = [%q]\n[[maintenance]]\nname = 'fixture'\ncommand = [%q]\nevery = '1h'\nbusy_holders = ['busy']\n[[holder]]\nname = 'busy'\ncommand = [%q]\n", e.Root, command, holderCommand)
+				must(t, atomicWrite(e.A.ConfigFile, []byte(config), 0600))
+				_, err := e.A.loadConfig(e.A.ConfigFile)
+				check(t, err != nil && strings.Contains(err.Error(), "bare name or an absolute path"), "invalid executable accepted: %q: %v", executable, err)
+				if busy {
+					e.Cfg.Maintenance[0].BusyHolders = []map[string]any{{"command": []string{executable}}}
+				} else {
+					e.Cfg.Maintenance[0].Command[0] = executable
+				}
+				e.A.Run = func([]string, float64, string, []string) Result {
+					t.Fatal("invalid executable reached runner")
+					return Result{}
+				}
+				rows, _ := maintenanceRun(t, e, Args{})
+				check(t, rows[0].Status == "skipped", "invalid executable ran: %+v", rows)
+			})
+		}
+	}
+}
+
 func TestMaintenanceExecutableMustBeRegularAndExecutable(t *testing.T) {
 	for _, kind := range []string{"directory", "directory-link", "non-executable", "fifo"} {
 		for _, busy := range []bool{false, true} {

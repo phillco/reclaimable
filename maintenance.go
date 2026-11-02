@@ -106,7 +106,7 @@ func knownKeys(m map[string]any, allowed ...string) error {
 	}
 	return nil
 }
-func parseMaintenance(raw map[string]any, holders []map[string]any) ([]Maintenance, bool, error) {
+func parseMaintenance(raw map[string]any, holders []map[string]any, configFile string) ([]Maintenance, bool, error) {
 	armed := false
 	if v, exists := raw["maintenance_armed"]; exists {
 		var ok bool
@@ -151,6 +151,7 @@ func parseMaintenance(raw map[string]any, holders []map[string]any) ([]Maintenan
 				return nil, false, fmt.Errorf("maintenance argv contains NUL")
 			}
 		}
+		cmd[0] = expandConfigDir(cmd[0], configFile)
 		if err := maintenanceExecutableName(cmd[0]); err != nil {
 			return nil, false, err
 		}
@@ -217,7 +218,7 @@ func parseMaintenance(raw map[string]any, holders []map[string]any) ([]Maintenan
 			if err != nil {
 				return nil, false, err
 			}
-			if err := maintenanceExecutableName(cmd[0]); err != nil {
+			if err := maintenanceExecutableName(expandConfigDir(cmd[0], configFile)); err != nil {
 				return nil, false, fmt.Errorf("busy holder %q: %w", ref, err)
 			}
 			// Holders use seconds, unlike maintenance's duration strings.
@@ -271,7 +272,7 @@ func (a *App) maintenanceInUse(h Maintenance) string {
 		if err != nil {
 			return err.Error()
 		}
-		if err := maintenanceExecutableName(cmd[0]); err != nil {
+		if err := maintenanceExecutableName(expandConfigDir(cmd[0], a.ConfigFile)); err != nil {
 			return err.Error()
 		}
 		if reason := a.commandHoldWithRunner(holder, &Marker{Folder: a.Home, Owner: h.Name, Kind: "cache"}, a.runMaintenanceProbe); reason != "" {
@@ -289,7 +290,7 @@ func (a *App) inspectMaintenance(args Args, cfg *Config, h Maintenance, last map
 		row.Detail = "not due"
 		return row, ""
 	}
-	executable, err := maintenanceExecutable(h.Command[0])
+	executable, err := maintenanceExecutable(expandConfigDir(h.Command[0], a.ConfigFile))
 	if err != nil {
 		row.Detail = "executable unavailable: " + err.Error()
 		return row, ""

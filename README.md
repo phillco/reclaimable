@@ -310,8 +310,11 @@ bypass arming, free-space triggers, busy holders or in-use checks.
 
 The config's argv arrays are the allow-list: commands are never read from markers
 or other data files, substituted with marker values, or passed through a shell.
-Each hook executable must be a bare name or an absolute path; configured relative
-paths containing `/` (including `./tool` and `~/bin/tool`) are config errors.
+Each hook executable must be a bare name or an absolute path. In executable
+names, `{config_dir}` expands to the config file's directory before validation,
+so `command = ["{config_dir}/helper"]` works for hooks and busy holders. No other
+executable placeholder is expanded during validation; configured relative paths
+containing `/` (including `./tool` and `~/bin/tool`) are config errors.
 Bare names are resolved through the current PATH once per attempt and pinned to
 an absolute path before execution, so the hook's home working directory cannot
 change which executable runs. Executables must resolve to regular executable

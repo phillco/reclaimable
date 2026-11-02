@@ -323,7 +323,7 @@ func (a *App) loadConfig(path string) (*Config, error) {
 			return nil, errors.New("maintenance_only must be true or false")
 		}
 	}
-	maintenance, maintenanceArmed, e := parseMaintenance(raw, holders)
+	maintenance, maintenanceArmed, e := parseMaintenance(raw, holders, path)
 	if e != nil {
 		return nil, e
 	}

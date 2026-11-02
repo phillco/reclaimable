@@ -290,18 +290,27 @@ func (a *App) fill(arg string, values map[string]string) string {
 	if strings.HasPrefix(arg, "~/") {
 		arg = a.expand(arg)
 	}
-	p, err := filepath.Abs(a.ConfigFile)
-	if err != nil {
-		p = a.ConfigFile
-	}
-	if real, e := filepath.EvalSymlinks(p); e == nil {
-		p = real
-	}
-	arg = strings.ReplaceAll(arg, "{config_dir}", filepath.Dir(p))
+	arg = expandConfigDir(arg, a.ConfigFile)
 	for k, v := range values {
 		arg = strings.ReplaceAll(arg, "{"+k+"}", v)
 	}
 	return arg
+}
+
+// Executable validation permits only this config-owned placeholder. Keep it
+// separate from fill, which also expands home and marker-provided values.
+func expandConfigDir(arg, configFile string) string {
+	if !strings.Contains(arg, "{config_dir}") {
+		return arg
+	}
+	p, err := filepath.Abs(configFile)
+	if err != nil {
+		p = configFile
+	}
+	if real, e := filepath.EvalSymlinks(p); e == nil {
+		p = real
+	}
+	return strings.ReplaceAll(arg, "{config_dir}", filepath.Dir(p))
 }
 func withEnv(values map[string]string) []string {
 	env := os.Environ()
