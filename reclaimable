@@ -143,12 +143,15 @@ DATA_VOLUME = "/System/Volumes/Data"
 def strip_data(p: str | Path) -> Path:
     """macOS firmlinks make /System/Volumes/Data/Users/x the same directory as
     /Users/x with no symlink involved: use the canonical spelling everywhere."""
-    text = str(p)
-    if text == DATA_VOLUME:
-        return Path("/")
-    if text.startswith(DATA_VOLUME + "/"):
-        return Path(text[len(DATA_VOLUME) :])
-    return Path(text)
+    path = Path(p)
+    # POSIX permits a special meaning for //; on supported filesystems it is /.
+    if path.anchor == "//":
+        path = Path("/", *path.parts[1:])
+    prefix = Path(DATA_VOLUME).parts
+    if tuple(map(fold, path.parts[: len(prefix)])) == tuple(map(fold, prefix)):
+        # Never slice text using folded lengths: Unicode folding can change them.
+        return Path("/", *path.parts[len(prefix) :])
+    return path
 
 
 def expand(p: str | Path) -> Path:
@@ -170,6 +173,26 @@ def pmatch(text: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(fold(text), fold(pattern))
 
 
+def path_key(path: str | Path) -> str:
+    """Comparison only: canonical alias, absolute, case-folded and normalised.
+
+    Keep original filesystem spellings for I/O and content/hash inventories.
+    NFKC includes NFC equivalence and deliberately over-protects compatibility
+    spellings too, as with component-name denies.
+    """
+    return fold(str(expand(path)))
+
+
+def path_match(path: str | Path, pattern: str | Path) -> bool:
+    return fnmatch.fnmatchcase(path_key(path), path_key(pattern))
+
+
+def within(path: str | Path, root: str | Path) -> bool:
+    """Whether a path is equal to or below a root, conservatively by spelling."""
+    child, parent = Path(path_key(path)), Path(path_key(root))
+    return child == parent or parent in child.parents
+
+
 def identity(path: Path) -> tuple[int, int] | None:
     try:
         st = os.stat(path)
@@ -179,13 +202,14 @@ def identity(path: Path) -> tuple[int, int] | None:
 
 
 def protected_identities(cfg: "Config") -> set[tuple[int, int]]:
-    """Filesystem identities of the existing, non-glob deny paths."""
-    out = set()
+    """Identities of deny paths, including glob matches; unreadable fails closed."""
+    return {ident for p in deny_targets(cfg) if (ident := identity(p)) is not None}
+
+
+def deny_targets(cfg: "Config") -> list[Path]:
+    out = []
     for raw in cfg.deny_paths:
-        if not glob.has_magic(str(expand(raw))):
-            ident = identity(expand(raw))
-            if ident:
-                out.add(ident)
+        out.extend(expand_dirs(raw))
     return out
 
 
@@ -403,7 +427,7 @@ def load_config(path: Path | None = None) -> Config:
         deny_sequences=list(DENY_SEQUENCES) + sequences,
         deny_exact=BROAD + _strings(raw, "deny_exact"),
         volume_floors={
-            str(expand(k)): parse_size(str(v))
+            path_key(k): parse_size(str(v))
             for k, v in raw.get("volume_floors", {}).items()
         },
         holders=holders,
@@ -544,19 +568,23 @@ def deny_reason(path: Path, cfg: Config) -> str | None:
     link = next((p for p in (path, *path.parents) if p.is_symlink()), None)
     if link is not None:
         return f"symlink in path ({link}); mark the real directory"
-    real = strip_data(os.path.realpath(path))
-    protected = protected_identities(cfg)
+    real = expand(os.path.realpath(path))
+    try:
+        targets = deny_targets(cfg)
+    except Unreadable as e:
+        return f"deny-list unreadable ({e})"
+    protected = {identity(p) for p in targets} - {None}
     for candidate in {path, real}:
         chain = [candidate, *candidate.parents]
         chain_ids = [identity(p) for p in chain]
         cand_id = chain_ids[0]
         for raw in cfg.deny_exact:
             target = expand(raw)
-            if fold(str(candidate)) == fold(str(target)) or (
+            if path_key(candidate) == path_key(target) or (
                 cand_id is not None and cand_id == identity(target)
             ):
                 return f"broad folder {raw}"
-        if fold(str(candidate.parent)) in ("/users", "/volumes"):
+        if path_key(candidate.parent) in ("/users", "/volumes"):
             return "home or volume root"
         for ident in chain_ids:
             if ident is not None and ident in protected:
@@ -565,17 +593,19 @@ def deny_reason(path: Path, cfg: Config) -> str | None:
             pattern = str(expand(raw))
             # The path is (inside) a denied path, or contains one.
             for anc in chain:
-                if pmatch(str(anc), pattern):
+                if path_match(anc, pattern):
                     return f"deny-list {raw}"
-            if str(candidate) != "/" and pmatch(pattern + "/", str(candidate) + "/*"):
-                return f"contains deny-listed {raw}"
-            base = pattern.split("*")[0]
-            if "*" in pattern and fold(base).startswith(fold(str(candidate)) + "/"):
+            base = Path(pattern)
+            while glob.has_magic(str(base)):
+                base = base.parent
+            if within(base, candidate):
                 return f"may contain deny-listed {raw}"
-            if not glob.has_magic(pattern) and cand_id is not None:
-                target = expand(raw)
-                if cand_id in {identity(p) for p in (target, *target.parents)}:
-                    return f"contains deny-listed {raw}"
+        for target in targets:
+            if within(target, candidate) or (
+                cand_id is not None
+                and cand_id in {identity(p) for p in (target, *target.parents)}
+            ):
+                return f"contains deny-listed {target}"
         if any(fold(p) in DENY_SELF_NAMES for p in candidate.parts):
             return "inside a .git/.jj dir"
         hit = _deny_name_hit(candidate.parts, cfg)
@@ -628,9 +658,11 @@ def scan(
     """Find marker folders; prunes deny-listed trees and never descends into marked folders."""
     found: set[str] = set()
     deadline = time.monotonic() + limit_s
-    prune_paths = {str(expand(p)) for p in SCAN_PRUNE_PATHS}
+    prune_paths = {path_key(p) for p in SCAN_PRUNE_PATHS}
+    prune_names = {fold(p) for p in SCAN_PRUNE_NAMES}
     complete = True
-    for root in roots:
+    for raw_root in roots:
+        root = expand(raw_root)
         stack = [(root, 0)]
         root_dev = None
         with contextlib.suppress(OSError):
@@ -644,7 +676,8 @@ def scan(
             except OSError:
                 continue
             if any(
-                e.name == MARKER and e.is_file(follow_symlinks=False) for e in entries
+                fold(e.name) == fold(MARKER) and e.is_file(follow_symlinks=False)
+                for e in entries
             ):
                 found.add(str(folder))
                 continue
@@ -655,18 +688,18 @@ def scan(
                 try:
                     if not e.is_dir(follow_symlinks=False):
                         continue
-                    if e.name in SCAN_PRUNE_NAMES or e.name.endswith(
+                    if fold(e.name) in prune_names or fold(e.name).endswith(
                         (".app", ".photoslibrary")
                     ):
                         continue
-                    if e.path in prune_paths:
+                    if path_key(e.path) in prune_paths:
                         continue
                     if (
                         root_dev is not None
                         and e.stat(follow_symlinks=False).st_dev != root_dev
                     ):
                         continue
-                    if any(pmatch(e.path, str(expand(p))) for p in cfg.deny_paths):
+                    if any(path_match(e.path, p) for p in cfg.deny_paths):
                         continue
                 except OSError:
                     continue
@@ -695,10 +728,10 @@ def discover(
             reg["markers"].setdefault(norm, reg["markers"].pop(f))
             f = norm
         p = Path(f)
-        if p in folders:
+        if any(path_key(p) == path_key(f) for f in folders):
             continue
         if (p / MARKER).is_file():
-            if not roots or any(p == r or r in p.parents for r in roots):
+            if not roots or any(within(p, r) for r in roots):
                 folders.append(p)
         else:
             del reg["markers"][f]
@@ -707,12 +740,15 @@ def discover(
 
 def export_ok(path: Path) -> bool:
     """Skip paths a downstream consumer would likely reject: symlinks, mounts, roots."""
+    path = expand(path)
     try:
         if any(p.is_symlink() for p in (path, *path.parents)) or path.is_mount():
             return False
     except OSError:
         return False
-    return path.parent not in (Path("/Users"), Path("/Volumes")) and path != HOME
+    return path_key(path.parent) not in ("/users", "/volumes") and path_key(
+        path
+    ) != path_key(HOME)
 
 
 def write_export_list(reg: dict, cfg: Config) -> None:
@@ -759,7 +795,7 @@ def pid_alive(pid: int) -> bool:
 
 
 def related(a: Path, b: Path) -> bool:
-    return a == b or a in b.parents or b in a.parents
+    return within(a, b) or within(b, a)
 
 
 def open_files(folder: Path) -> str | None:
@@ -828,19 +864,22 @@ def list_dir(path: Path) -> list[os.DirEntry]:
 def expand_dirs(pattern: str) -> list[Path]:
     """Directories matching a path or glob, raising Unreadable (never silently
     skipping) when a directory on the way can't be listed."""
-    parts = Path(pattern).expanduser().parts
-    found = [Path(parts[0])] if parts else []
-    for part in parts[1:]:
+    path = expand(pattern)
+    deadline = time.monotonic() + WALK_LIMIT_S
+    parts = path.parts
+    # For globs, enumerate literal components too: a differently cased or
+    # decomposed literal on a case-sensitive filesystem must not hide matches.
+    found = [Path(parts[0])] if glob.has_magic(str(path)) else [path]
+    for part in parts[1:] if glob.has_magic(str(path)) else ():
         nxt: list[Path] = []
         for base in found:
-            if glob.has_magic(part):
-                nxt += [
-                    Path(e.path)
-                    for e in sorted(list_dir(base), key=lambda e: e.name)
-                    if pmatch(e.name, part)
-                ]
-            else:
-                nxt.append(base / part)
+            if time.monotonic() > deadline:
+                raise Unreadable(f"glob expansion timed out: {pattern}")
+            nxt += [
+                Path(e.path)
+                for e in sorted(list_dir(base), key=lambda e: e.name)
+                if pmatch(e.name, part)
+            ]
         found = nxt
     out = []
     for p in found:
@@ -855,7 +894,9 @@ def expand_dirs(pattern: str) -> list[Path]:
 
 
 def json_files(path: Path) -> list[Path]:
-    return sorted(Path(e.path) for e in list_dir(path) if e.name.endswith(".json"))
+    return sorted(
+        Path(e.path) for e in list_dir(path) if fold(e.name).endswith(".json")
+    )
 
 
 def lease_hold(holder: dict, marker: Marker) -> str | None:
@@ -1029,12 +1070,7 @@ def job_closed(
         return None, None, "no job_done command configured"
     cache = reg.setdefault("jobs", {})
     hit = cache.get(job)
-    if (
-        not fresh
-        and hit
-        and hit.get("closed")
-        and now() - hit.get("checked", 0) < 3600
-    ):
+    if not fresh and hit and hit.get("closed") and now() - hit.get("checked", 0) < 3600:
         return True, hit.get("closed_at"), "closed"
     first_seen = (hit or {}).get("first_closed_seen")
     cmd = [_fill(a, job=job) for a in cfg.job_done["command"]]
@@ -1199,7 +1235,9 @@ def ignored_files(folder: Path, repo: str) -> str | None:
                 return "git status --ignored failed"
             for line in res.stdout.splitlines():
                 if line.startswith("!! ") and line[3:].rstrip("/") != MARKER:
-                    return f"contains ignored files; marker lacks ignored_ok ({line[3:]})"
+                    return (
+                        f"contains ignored files; marker lacks ignored_ok ({line[3:]})"
+                    )
             return None
         res = run(
             ["jj", "--ignore-working-copy", "file", "list"],
@@ -1236,6 +1274,7 @@ def walk(
     folder: Path, cfg: Config, check_names: bool, limit_s: float = WALK_LIMIT_S
 ) -> Walk:
     """Disk usage plus deny-listed descendants and nested repos; incomplete walks fail closed."""
+    folder = expand(folder)
     size = files = 0
     repos: list[Path] = []
     crossed: list[Path] = []
@@ -1243,7 +1282,10 @@ def walk(
     deadline = time.monotonic() + limit_s
     dev = folder.lstat().st_dev
     patterns = [str(expand(p)) for p in cfg.deny_paths]
-    protected = protected_identities(cfg)
+    try:
+        protected = protected_identities(cfg)
+    except Unreadable as e:
+        return Walk(None, files, f"deny-list unreadable ({e})", repos)
     stack = [folder]
     while stack:
         if time.monotonic() > deadline:
@@ -1256,8 +1298,10 @@ def walk(
         for e in entries:
             try:
                 st = e.stat(follow_symlinks=False)
-            except OSError:
-                continue
+            except OSError as e:
+                return Walk(
+                    None, files, f"unreadable {e.filename}: {e.strerror}", repos
+                )
             files += 1
             # A hardlinked file is one allocation however many names it has here.
             if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
@@ -1267,7 +1311,7 @@ def walk(
             else:
                 size += st.st_blocks * 512
             rel = Path(e.path).relative_to(folder).parts
-            hit_path = any(pmatch(e.path, pattern) for pattern in patterns)
+            hit_path = any(path_match(e.path, pattern) for pattern in patterns)
             if hit_path or (st.st_dev, st.st_ino) in protected:
                 return Walk(None, files, f"contains deny-listed {'/'.join(rel)}", repos)
             if check_names:
@@ -1276,7 +1320,7 @@ def walk(
                     return Walk(
                         None, files, f"contains deny-listed {'/'.join(rel)}", repos
                     )
-            if fold(e.name) in (".git", ".jj") and d != folder:
+            if fold(e.name) in (".git", ".jj") and path_key(d) != path_key(folder):
                 repos.append(Path(d))
             if e.is_dir(follow_symlinks=False):
                 if st.st_dev == dev:
@@ -1370,7 +1414,10 @@ def tree_problem(
     if w.problem:
         return w.problem, None
     if w.crossed:
-        return f"contains another filesystem at {w.crossed[0].relative_to(folder)}", None
+        return (
+            f"contains another filesystem at {w.crossed[0].relative_to(folder)}",
+            None,
+        )
     repo, problem = repo_state(folder)
     if problem:
         return f"worktree {problem}", repo
@@ -1808,7 +1855,10 @@ def volume_limits(folder: Path, cfg: Config) -> tuple[int, int] | None:
     mount = folder
     while not os.path.ismount(mount) and mount != mount.parent:
         mount = mount.parent
-    floor = cfg.volume_floors.get(str(expand(mount)), cfg.floor if dev == home_dev else None)
+    floor = next(
+        (v for k, v in cfg.volume_floors.items() if path_key(k) == path_key(mount)),
+        cfg.floor if dev == home_dev else None,
+    )
     if floor is None:
         return None
     return floor, (cfg.target if dev == home_dev else floor + TARGET_MARGIN)
@@ -1827,8 +1877,9 @@ def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
         mount = group[0].folder
         while not os.path.ismount(mount) and mount != mount.parent:
             mount = mount.parent
-        floor = cfg.volume_floors.get(
-            str(expand(mount)), cfg.floor if dev == home_dev else None
+        floor = next(
+            (v for k, v in cfg.volume_floors.items() if path_key(k) == path_key(mount)),
+            cfg.floor if dev == home_dev else None,
         )
         if floor is None:
             continue
@@ -1902,11 +1953,16 @@ def sweep(args, cfg: Config) -> int:
                         )
                         log(line)
                         say(line)
-                        done.append({**v.row(), "why": why, "done": False, "detail": "target reached"})
+                        done.append(
+                            {
+                                **v.row(),
+                                "why": why,
+                                "done": False,
+                                "detail": "target reached",
+                            }
+                        )
                         continue
-            ok, detail = remove_folder(
-                v, armed, cfg, reg, floor_pressure=pressure
-            )
+            ok, detail = remove_folder(v, armed, cfg, reg, floor_pressure=pressure)
             if ok and dev is not None:
                 freed_on[dev] = freed_on.get(dev, 0) + (v.size or 0)
             line = (
@@ -1955,7 +2011,7 @@ def sweep(args, cfg: Config) -> int:
 
 def resolve_folder(raw: str) -> Path:
     p = expand(raw)
-    if p.name == MARKER:
+    if fold(p.name) == fold(MARKER):
         p = p.parent
     return p
 
@@ -2029,6 +2085,12 @@ def cmd_hold(args, cfg: Config, release: bool = False) -> int:
             print(f"reclaimable: {folder}: {e}", file=sys.stderr, flush=True)
             return 1
         sub = expand(args.subpath) if args.subpath else None
+
+        def same_subpath(a, b):
+            if a is None or b is None:
+                return a is b
+            return isinstance(a, str) and path_key(a) == path_key(b)
+
         if release:
             before = len(m.holds)
             m.holds = [
@@ -2036,7 +2098,7 @@ def cmd_hold(args, cfg: Config, release: bool = False) -> int:
                 for h in m.holds
                 if not (
                     h.get("job") == args.job
-                    and (sub is None or h.get("path") == str(sub))
+                    and (sub is None or same_subpath(h.get("path"), str(sub)))
                 )
             ]
             if len(m.holds) == before:
@@ -2053,7 +2115,10 @@ def cmd_hold(args, cfg: Config, release: bool = False) -> int:
             m.holds = [
                 h
                 for h in m.holds
-                if not (h.get("job") == args.job and h.get("path") == hold.get("path"))
+                if not (
+                    h.get("job") == args.job
+                    and same_subpath(h.get("path"), hold.get("path"))
+                )
             ]
             m.holds.append(hold)
         write_marker(m)

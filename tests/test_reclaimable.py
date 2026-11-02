@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1500,3 +1501,172 @@ def test_identity_catches_other_spellings_of_a_protected_dir(env):
     assert rc.identity(other) == rc.identity(protected)
     assert rc.deny_reason(other, env.cfg)
     assert rc.protected_identities(env.cfg)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "/system/volumes/data",
+        "/sYsTeM/vOlUmEs/dAtA",
+        "/ſystem/Volumes/Data",  # folding changes the original component's spelling
+        "/Ｓystem/Volumes/Data",  # conservative compatibility normalisation
+    ],
+)
+def test_data_prefix_variants_block_combined_glob_bypass(env, prefix):
+    f = make(env, "bucket", age_s=30 * DAY, files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(str(env.root / "data/*/models"))
+    v = rc.evaluate(Path(prefix + str(f)), env.cfg, env.reg)
+    assert v.folder == f
+    assert not v.safe and "deny-list" in v.reason
+    assert (f / "models/weights").read_bytes() == b"keep"
+
+
+def test_decomposed_data_prefix_is_canonical(env, monkeypatch):
+    # The real prefix is ASCII (NFD is identical). An accented test prefix proves
+    # canonical composition works without creating anything outside this fixture.
+    monkeypatch.setattr(rc, "DATA_VOLUME", "/Systém/Volumes/Data")
+    f = make(env, "café", files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(str(env.root / "data/*/models"))
+    prefix = unicodedata.normalize("NFD", rc.DATA_VOLUME).swapcase()
+    v = rc.evaluate(Path(prefix + str(f)), env.cfg, env.reg)
+    assert v.folder == f
+    assert not v.safe and "deny-list" in v.reason
+
+
+@pytest.mark.parametrize("pattern", ["*.bin", "[w]*.bin", "?.bin"])
+def test_glob_deny_protects_hardlink_identity(env, pattern):
+    protected = env.root / "protected"
+    protected.mkdir()
+    target = protected / "w.bin"
+    target.write_bytes(b"keep")
+    f = make(env, "bucket")
+    os.link(target, f / "innocent")
+    env.cfg.deny_paths.append(str(protected / pattern))
+    assert rc.identity(target) in rc.protected_identities(env.cfg)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "deny-list" in v.reason
+
+
+def test_glob_identity_expansion_folds_literal_components(env):
+    protected = env.root / "café-keep"
+    protected.mkdir()
+    target = protected / "Weights.bin"
+    target.write_bytes(b"keep")
+    f = make(env, "bucket")
+    os.link(target, f / "innocent")
+    env.cfg.deny_paths.append(str(env.root / "CAFÉ-KEEP/*.BIN"))
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+
+
+def test_unreadable_deny_glob_fails_closed(env, monkeypatch):
+    f = make(env, "bucket")
+    protected = env.root / "protected"
+    protected.mkdir()
+    env.cfg.deny_paths.append(str(protected / "*/models"))
+    original = rc.list_dir
+
+    def unreadable(path):
+        if path == protected:
+            raise rc.Unreadable("permission denied")
+        return original(path)
+
+    monkeypatch.setattr(rc, "list_dir", unreadable)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "unreadable" in v.reason
+    assert rc.deny_reason(f, env.cfg)
+
+
+@pytest.mark.parametrize("prefix", ["/system/volumes/data", "/sYsTeM/vOlUmEs/dAtA"])
+def test_data_prefix_variants_in_deny_patterns_and_walk(env, prefix):
+    f = make(env, "bucket", files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(prefix + str(env.root / "data/*/models"))
+    assert rc.walk(f, env.cfg, check_names=True).problem
+    assert rc.deny_reason(Path(prefix + str(f / "models")), env.cfg)
+    assert rc.deny_reason(Path(prefix + "/Users"), env.cfg)
+
+
+def test_related_paths_fold_normalise_and_strip_prefix(env):
+    f = make(env, "café")
+    ref = Path("/system/volumes/data" + unicodedata.normalize("NFD", str(f)).upper())
+    assert rc.related(ref / "child", f)
+    assert rc.related(f, ref / "child")
+    assert not rc.related(f, f.with_name(f.name + "-other"))
+
+
+def test_lease_data_alias_and_case_variant_holds(env):
+    f = make(env, "café")
+    leases = env.root / "leases"
+    leases.mkdir()
+    (leases / "1.json").write_text(
+        json.dumps(
+            {"pid": os.getpid(), "what": "/system/volumes/data" + str(f).upper()}
+        )
+    )
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "lease" in v.reason
+
+
+def test_discovery_roots_use_canonical_comparisons(env):
+    f = make(env, "café")
+    reg = {"markers": {str(f): {}}, "last_scan": rc.now()}
+    root = Path("/system/volumes/data" + str(f.parent).upper())
+    assert rc.discover(env.cfg, reg, roots=[root]) == [f]
+
+
+def test_export_broad_roots_use_canonical_comparisons(env, monkeypatch):
+    monkeypatch.setattr(rc, "HOME", env.root / "Home")
+    assert not rc.export_ok(Path("/system/volumes/data" + str(rc.HOME).upper()))
+    assert not rc.export_ok(Path("/system/volumes/data/uSeRs/example"))
+
+
+def test_double_slash_data_prefix_and_component_boundaries(env):
+    assert rc.expand("//sYsTeM/Volumes/Data/Users") == Path("/Users")
+    assert rc.deny_reason(Path("//Users"), env.cfg)
+    assert rc.expand("/System/Volumes/Database/x") == Path("/System/Volumes/Database/x")
+
+
+def test_scan_pruning_folds_paths_and_names(env, monkeypatch):
+    make(env, "NODE_MODULES/cache")
+    make(env, "ordinary/.GIT/cache")
+    f = make(env, "café/cache")
+    monkeypatch.setattr(rc, "SCAN_PRUNE_PATHS", [str(f.parent).upper()])
+    found, complete = rc.scan(env.cfg.roots, env.cfg)
+    assert complete and not found
+
+
+def test_hold_paths_deduplicate_and_release_canonical_alias(env):
+    f = make(env, "café")
+    child = str(f / "part")
+    other = "/sYsTeM/Volumes/Data" + unicodedata.normalize("NFD", child).upper()
+    assert rc.main(["hold", str(f), "job42", "-p", child]) == 0
+    assert rc.main(["hold", str(f), "job42", "-p", other]) == 0
+    assert len(rc.read_marker(f).holds) == 1
+    assert rc.main(["release", str(f), "job42", "-p", child]) == 0
+    assert not rc.read_marker(f).holds
+
+
+def test_volume_floor_lookup_uses_canonical_path(env, monkeypatch):
+    f = make(env, "bucket")
+    monkeypatch.setattr(rc.os.path, "ismount", lambda p: p == f.parent)
+    env.cfg.volume_floors = {"/system/volumes/data" + str(f.parent).upper(): 123}
+    assert rc.volume_limits(f, env.cfg)[0] == 123
+
+
+def test_glob_ancestor_identity_protects_other_alias(env, monkeypatch):
+    protected = env.root / "keep"
+    target = protected / "child"
+    target.mkdir(parents=True)
+    f = make(env, "bucket")
+    env.cfg.deny_paths.append(str(protected / "chi?d"))
+    original = rc.identity
+    # Simulate a non-symlink directory alias without needing another mount.
+    monkeypatch.setattr(
+        rc, "identity", lambda p: original(protected) if p == f else original(p)
+    )
+    assert rc.deny_reason(f, env.cfg)
+
+
+def test_missing_glob_is_not_a_global_veto(env):
+    f = make(env, "bucket")
+    env.cfg.deny_paths.append(str(env.root / "absent/*/models"))
+    assert rc.evaluate(f, env.cfg, env.reg).safe
