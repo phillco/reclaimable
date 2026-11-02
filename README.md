@@ -68,6 +68,12 @@ completed keeps the folder (fail closed):
    the root, home, volume roots, `~/Documents` and other broad folders (exact match),
    anything inside a `.git`/`.jj` directory, `~/.ssh`, `~/.gnupg`, `*.photoslibrary`.
    The config can only **add** to the deny-lists.
+   Matching is conservative: names and paths are compared case-folded and
+   Unicode-normalised (case variants and NFC/NFD spellings are the same), the macOS
+   `/System/Volumes/Data` firmlink prefix is removed from every path, and protected
+   paths and their ancestors are also compared by filesystem identity (device and
+   inode), including descendants found while walking a marked folder. This
+   over-protects on case-sensitive volumes on purpose.
 2. **Holds**: any entry in `holds` keeps the folder.
 3. **Live readers**: `lsof +D` (90 s cap) must show nothing open under it.
 4. **Holders** (config): external commands and lease directories that can veto a

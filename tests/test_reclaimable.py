@@ -1406,3 +1406,97 @@ def test_jj_secondary_workspace_ignored_files(env):
     (ws / "data").mkdir()
     (ws / "data/y").write_text("y")
     assert "ignored files" in rc.ignored_files(ws, "jj-secondary")
+
+
+# --- aliases: Data-volume firmlinks, case, Unicode --------------------------------
+
+
+def alias(path):
+    return Path("/System/Volumes/Data" + str(path))
+
+
+@pytest.mark.skipif(
+    not Path("/System/Volumes/Data").exists(), reason="no APFS Data volume here"
+)
+def test_data_volume_alias_of_protected_path_is_refused(env):
+    protected = env.root / "data/protected"
+    protected.mkdir(parents=True)
+    env.cfg.deny_paths.append(str(protected))
+    assert rc.deny_reason(protected / "x", env.cfg)
+    assert rc.deny_reason(alias(protected), env.cfg)
+    assert rc.deny_reason(alias(protected / "x"), env.cfg)
+    assert rc.main(["mark", str(alias(protected / "x")), "-o", "t", "-r", "r"]) == 2
+    # built-ins, broad roots and exact denies share the gap
+    assert rc.deny_reason(alias(Path.home() / ".ssh/keys"), env.cfg)
+    assert rc.deny_reason(alias(Path.home()), env.cfg)
+    assert rc.deny_reason(Path("/System/Volumes/Data"), env.cfg)
+    # an evaluated folder reached through the alias is the same folder
+    f = make(env, "al", age_s=30 * DAY)
+    assert rc.evaluate(alias(f), env.cfg, env.reg).folder == f
+
+
+def test_case_variants_of_protected_paths(env):
+    root = env.root
+    (root / "Documents").mkdir()
+    (root / "Protected").mkdir()
+    env.cfg.deny_exact.append(str(root / "Documents"))
+    env.cfg.deny_paths.append(str(root / "Protected"))
+    for variant in ("documents", "DOCUMENTS"):
+        assert rc.deny_reason(root / variant, env.cfg), variant
+    for variant in ("protected", "PROTECTED"):
+        assert rc.deny_reason(root / variant / "sub", env.cfg), variant
+    assert rc.deny_reason(root / "other", env.cfg) is None
+
+
+def test_unicode_normalisation_variants(env):
+    env.cfg.deny_names.append("café")  # NFC
+    nfd = "café"
+    assert rc.deny_reason(env.root / nfd, env.cfg)
+    env.cfg.deny_paths.append(str(env.root / "café-keep"))
+    assert rc.deny_reason(env.root / "café-keep" / "x", env.cfg)
+    f = make(env, "uni", age_s=30 * DAY, files={f"{nfd}/x": b"1"})
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "deny-listed" in v.reason
+
+
+def test_photoslibrary_uppercase(env):
+    assert rc.deny_reason(env.root / "Pics.PHOTOSLIBRARY" / "x", env.cfg)
+    assert rc.deny_reason(env.root / "Pics.PhotosLibrary", env.cfg)
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "x/Models/w.bin",
+        "x/MODELS/w.bin",
+        "Frozen-X/a",
+        "a/Receipt",
+        "Experiments/Results/r1",
+    ],
+)
+def test_case_variant_descendant_names_block(env, rel):
+    env.cfg.deny_names += ["models", "frozen*", "*receipt*"]
+    env.cfg.deny_sequences.append(("experiments", "results"))
+    f = make(env, "cv", age_s=30 * DAY, files={rel: b"1"})
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "deny-listed" in v.reason
+
+
+def test_case_variant_descendant_glob_and_git_dirs(env):
+    env.cfg.deny_paths.append(str(env.root / "data/*/Models"))
+    f = make(env, "bk", age_s=30 * DAY, files={"models/w": b"1"})
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+    assert rc.deny_reason(env.root / "src/foo/.GIT", env.cfg)
+    assert rc.deny_reason(env.root / "src/foo/.Jj/repo", env.cfg)
+
+
+def test_identity_catches_other_spellings_of_a_protected_dir(env):
+    protected = env.root / "Keep"
+    protected.mkdir()
+    env.cfg.deny_paths.append(str(protected))
+    other = env.root / "keep"
+    if not other.exists():
+        pytest.skip("case-sensitive filesystem")
+    assert rc.identity(other) == rc.identity(protected)
+    assert rc.deny_reason(other, env.cfg)
+    assert rc.protected_identities(env.cfg)

@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -136,10 +137,56 @@ def say(*args) -> None:
     print(*args, flush=True)
 
 
+DATA_VOLUME = "/System/Volumes/Data"
+
+
+def strip_data(p: str | Path) -> Path:
+    """macOS firmlinks make /System/Volumes/Data/Users/x the same directory as
+    /Users/x with no symlink involved: use the canonical spelling everywhere."""
+    text = str(p)
+    if text == DATA_VOLUME:
+        return Path("/")
+    if text.startswith(DATA_VOLUME + "/"):
+        return Path(text[len(DATA_VOLUME) :])
+    return Path(text)
+
+
 def expand(p: str | Path) -> Path:
     """Absolute, lexically normalised path (`~` expanded, relative paths taken from
-    the current directory, `..` collapsed; symlinks are NOT resolved)."""
-    return Path(os.path.abspath(Path(p).expanduser()))
+    the current directory, `..` collapsed, the Data-volume firmlink prefix removed;
+    symlinks are NOT resolved)."""
+    return strip_data(os.path.abspath(Path(p).expanduser()))
+
+
+def fold(text: str) -> str:
+    """Conservative comparison form: Unicode-normalised and case-folded, so case
+    variants and NFC/NFD spellings of a protected name compare equal. Over-protecting
+    on case-sensitive volumes is intended."""
+    out = unicodedata.normalize("NFKC", text).casefold()
+    return unicodedata.normalize("NFKC", out)
+
+
+def pmatch(text: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(fold(text), fold(pattern))
+
+
+def identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def protected_identities(cfg: "Config") -> set[tuple[int, int]]:
+    """Filesystem identities of the existing, non-glob deny paths."""
+    out = set()
+    for raw in cfg.deny_paths:
+        if not glob.has_magic(str(expand(raw))):
+            ident = identity(expand(raw))
+            if ident:
+                out.add(ident)
+    return out
 
 
 def hostname() -> str:
@@ -475,43 +522,61 @@ def write_marker(marker: Marker) -> None:
 def _deny_name_hit(parts, cfg: Config) -> str | None:
     for part in parts:
         for pat in cfg.deny_names:
-            if fnmatch.fnmatchcase(part, pat):
+            if pmatch(part, pat):
                 return part
+    folded = [fold(x) for x in parts]
     for seq in cfg.deny_sequences:
         n = len(seq)
-        for i in range(len(parts) - n + 1):
-            if tuple(parts[i : i + n]) == seq:
+        want = [fold(x) for x in seq]
+        for i in range(len(folded) - n + 1):
+            if folded[i : i + n] == want:
                 return "/".join(seq)
     return None
 
 
 def deny_reason(path: Path, cfg: Config) -> str | None:
-    """Why `path` itself may never be marked or removed (None when allowed)."""
+    """Why `path` itself may never be marked or removed (None when allowed).
+
+    Strings are compared case-folded and Unicode-normalised, and protected paths
+    (and their ancestors) are also compared by filesystem identity (device+inode),
+    so case variants, NFD spellings and firmlink aliases can't dodge them."""
     path = expand(path)
     link = next((p for p in (path, *path.parents) if p.is_symlink()), None)
     if link is not None:
         return f"symlink in path ({link}); mark the real directory"
-    real = Path(os.path.realpath(path))
+    real = strip_data(os.path.realpath(path))
+    protected = protected_identities(cfg)
     for candidate in {path, real}:
+        chain = [candidate, *candidate.parents]
+        chain_ids = [identity(p) for p in chain]
+        cand_id = chain_ids[0]
         for raw in cfg.deny_exact:
-            if candidate == expand(raw):
+            target = expand(raw)
+            if fold(str(candidate)) == fold(str(target)) or (
+                cand_id is not None and cand_id == identity(target)
+            ):
                 return f"broad folder {raw}"
-        if candidate.parent in (Path("/Users"), Path("/Volumes")):
+        if fold(str(candidate.parent)) in ("/users", "/volumes"):
             return "home or volume root"
+        for ident in chain_ids:
+            if ident is not None and ident in protected:
+                return "deny-list (same directory as a protected path)"
         for raw in cfg.deny_paths:
             pattern = str(expand(raw))
             # The path is (inside) a denied path, or contains one.
-            for anc in (candidate, *candidate.parents):
-                if fnmatch.fnmatchcase(str(anc), pattern):
+            for anc in chain:
+                if pmatch(str(anc), pattern):
                     return f"deny-list {raw}"
-            if str(candidate) != "/" and fnmatch.fnmatchcase(
-                pattern + "/", str(candidate) + "/*"
-            ):
+            if str(candidate) != "/" and pmatch(pattern + "/", str(candidate) + "/*"):
                 return f"contains deny-listed {raw}"
             base = pattern.split("*")[0]
-            if "*" in pattern and base.startswith(str(candidate) + "/"):
+            if "*" in pattern and fold(base).startswith(fold(str(candidate)) + "/"):
                 return f"may contain deny-listed {raw}"
-        if any(p in DENY_SELF_NAMES for p in candidate.parts):
+            if not glob.has_magic(pattern) and cand_id is not None:
+                target = expand(raw)
+                if cand_id in {identity(p) for p in (target, *target.parents)}:
+                    return f"contains deny-listed {raw}"
+        if any(fold(p) in DENY_SELF_NAMES for p in candidate.parts):
             return "inside a .git/.jj dir"
         hit = _deny_name_hit(candidate.parts, cfg)
         if hit:
@@ -601,10 +666,7 @@ def scan(
                         and e.stat(follow_symlinks=False).st_dev != root_dev
                     ):
                         continue
-                    if any(
-                        fnmatch.fnmatchcase(e.path, str(expand(p)))
-                        for p in cfg.deny_paths
-                    ):
+                    if any(pmatch(e.path, str(expand(p))) for p in cfg.deny_paths):
                         continue
                 except OSError:
                     continue
@@ -775,7 +837,7 @@ def expand_dirs(pattern: str) -> list[Path]:
                 nxt += [
                     Path(e.path)
                     for e in sorted(list_dir(base), key=lambda e: e.name)
-                    if fnmatch.fnmatchcase(e.name, part)
+                    if pmatch(e.name, part)
                 ]
             else:
                 nxt.append(base / part)
@@ -1181,6 +1243,7 @@ def walk(
     deadline = time.monotonic() + limit_s
     dev = folder.lstat().st_dev
     patterns = [str(expand(p)) for p in cfg.deny_paths]
+    protected = protected_identities(cfg)
     stack = [folder]
     while stack:
         if time.monotonic() > deadline:
@@ -1204,18 +1267,16 @@ def walk(
             else:
                 size += st.st_blocks * 512
             rel = Path(e.path).relative_to(folder).parts
-            for pattern in patterns:
-                if fnmatch.fnmatchcase(e.path, pattern):
-                    return Walk(
-                        None, files, f"contains deny-listed {'/'.join(rel)}", repos
-                    )
+            hit_path = any(pmatch(e.path, pattern) for pattern in patterns)
+            if hit_path or (st.st_dev, st.st_ino) in protected:
+                return Walk(None, files, f"contains deny-listed {'/'.join(rel)}", repos)
             if check_names:
                 hit = _deny_name_hit(rel, cfg)
                 if hit:
                     return Walk(
                         None, files, f"contains deny-listed {'/'.join(rel)}", repos
                     )
-            if e.name in (".git", ".jj") and d != folder:
+            if fold(e.name) in (".git", ".jj") and d != folder:
                 repos.append(Path(d))
             if e.is_dir(follow_symlinks=False):
                 if st.st_dev == dev:
