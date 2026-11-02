@@ -1123,6 +1123,43 @@ def repo_state(folder: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def ignored_files(folder: Path, repo: str) -> str | None:
+    """A reason when the checkout holds files its ignore rules hide (None when it has
+    none). Those aren't covered by the clean/pushed checks and may be irreplaceable.
+    Errors fail closed."""
+    try:
+        if repo.startswith("git"):
+            res = run(
+                ["git", "-C", str(folder), "status", "--porcelain", "--ignored"],
+                timeout=120,
+            )
+            if res.returncode != 0:
+                return "git status --ignored failed"
+            for line in res.stdout.splitlines():
+                if line.startswith("!! ") and line[3:].rstrip("/") != MARKER:
+                    return f"contains ignored files; marker lacks ignored_ok ({line[3:]})"
+            return None
+        res = run(
+            ["jj", "-R", str(folder), "--ignore-working-copy", "file", "list"],
+            timeout=120,
+        )
+        if res.returncode != 0:
+            return "jj file list failed"
+        tracked = set(res.stdout.splitlines())
+        for d, dirs, files in os.walk(folder):
+            rel_dir = os.path.relpath(d, folder)
+            if rel_dir == ".":
+                rel_dir = ""
+                dirs[:] = [x for x in dirs if x not in (".jj", ".git")]
+            for name in files:
+                rel = os.path.join(rel_dir, name)
+                if rel != MARKER and rel not in tracked:
+                    return f"contains ignored files; marker lacks ignored_ok ({rel})"
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "ignored-file check unavailable"
+
+
 @dataclass
 class Walk:
     size: int | None
@@ -1282,10 +1319,22 @@ def tree_problem(
         )
     if m.effective_kind == "worktree" and repo is None:
         return "kind worktree but no .git/.jj found", repo
+    ignored_ok = m.extra.get("ignored_ok") is True
+    if repo and not ignored_ok:
+        hidden = ignored_files(folder, repo)
+        if hidden:
+            return hidden, repo
     for nested in w.repos[:20]:
         nested_kind, problem = repo_state(nested)
         if problem:
             return f"nested repo {nested.relative_to(folder)} {problem}", repo
+        if nested_kind in ("git-linked", "jj-secondary") and not ignored_ok:
+            hidden = ignored_files(nested, nested_kind)
+            if hidden:
+                return (
+                    f"nested repo {nested.relative_to(folder)} {hidden}",
+                    repo,
+                )
         if nested_kind in ("git-primary", "jj-primary"):
             return (
                 f"nested {nested_kind} repository {nested.relative_to(folder)} "

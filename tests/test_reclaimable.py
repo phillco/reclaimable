@@ -1337,3 +1337,72 @@ def test_pressure_sweep_stops_when_real_free_space_reaches_target(env, monkeypat
     assert sum(f.exists() for f in folders) == 2, (
         "only the oldest is removed; the plan overshoots"
     )
+
+
+def ignore_in_main(main, pattern):
+    exclude = main / ".git/info/exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    exclude.write_text(pattern + "\n")
+
+
+def test_worktree_with_ignored_files_needs_ignored_ok(env):
+    main, wt = linked_worktree(env, "ig1")
+    ignore_in_main(main, "data/")
+    assert rc.evaluate(wt, env.cfg, env.reg).safe
+    (wt / "data").mkdir()
+    (wt / "data/copy.bin").write_bytes(b"irreplaceable")
+    v = rc.evaluate(wt, env.cfg, env.reg)
+    assert not v.safe and "contains ignored files; marker lacks ignored_ok" in v.reason
+    data = json.loads((wt / ".reclaimable").read_text())
+    data["ignored_ok"] = True
+    (wt / ".reclaimable").write_text(json.dumps(data))
+    old = time.time() - 30 * DAY
+    os.utime(wt / ".reclaimable", (old, old))
+    assert rc.evaluate(wt, env.cfg, env.reg).safe
+
+
+def test_ignored_file_added_before_removal_blocks(env):
+    main, wt = linked_worktree(env, "ig2")
+    ignore_in_main(main, "data/")
+    v = rc.evaluate(wt, env.cfg, env.reg)
+    assert v.safe
+    (wt / "data").mkdir()
+    (wt / "data/x").write_text("1")
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "ignored_ok" in detail and wt.exists()
+
+
+def test_nested_linked_worktree_ignored_files(env):
+    main = make_repo_with_remote(env)
+    ignore_in_main(main, "data/")
+    f = make(env, "ig3", age_s=30 * DAY, kind="mirror")
+    git("worktree", "add", "-q", "--detach", str(f / "wt"), cwd=main)
+    assert rc.evaluate(f, env.cfg, env.reg).safe
+    (f / "wt/data").mkdir()
+    (f / "wt/data/x").write_text("1")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "nested repo wt" in v.reason and "ignored_ok" in v.reason
+
+
+def test_ignored_ok_must_be_boolean(env):
+    f = make(env, "ig4", age_s=30 * DAY, ignored_ok="yes")
+    assert "ignored_ok" in rc.evaluate(f, env.cfg, env.reg).reason
+
+
+@pytest.mark.skipif(not rc.shutil.which("jj"), reason="jj not installed")
+def test_jj_secondary_workspace_ignored_files(env):
+    main = env.root / "jjmain"
+    subprocess.run(["jj", "git", "init", str(main)], check=True, capture_output=True)
+    (main / ".gitignore").write_text("data/\n")
+    (main / "a").write_text("a")
+    subprocess.run(
+        ["jj", "commit", "-m", "init"], cwd=main, check=True, capture_output=True
+    )
+    ws = env.root / "jjws"
+    subprocess.run(
+        ["jj", "workspace", "add", str(ws)], cwd=main, check=True, capture_output=True
+    )
+    assert rc.ignored_files(ws, "jj-secondary") is None
+    (ws / "data").mkdir()
+    (ws / "data/y").write_text("y")
+    assert "ignored files" in rc.ignored_files(ws, "jj-secondary")

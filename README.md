@@ -25,10 +25,12 @@ reclaimable arm                 # real sweeps begin 24 h later
 ```json
 {"owner": "mytool", "ttl": "3d", "regenerate": "mytool build recreates it",
  "kind": "mirror", "job": "1234", "session": "4242", "move_to": "backup:~/parked",
+ "ignored_ok": true,
  "holds": [{"job": "indexer", "path": "sub/dir", "at": 1762000000}]}
 ```
 
-`owner` and `regenerate` are required. `kind` is `cache` (default), `scratch`,
+`owner` and `regenerate` are required (a marker without a non-empty string for each
+is invalid and the folder is kept); `ignored_ok` is optional (see Safety model). `kind` is `cache` (default), `scratch`,
 `worktree`, `mirror` or `staged`. **Last use is the marker's mtime**: owners run
 `reclaimable touch PATH` (or `touch PATH/.reclaimable`) whenever they use the
 folder. Unknown fields are preserved. Default TTLs (`default_ttls` overrides):
@@ -84,11 +86,15 @@ completed keeps the folder (fail closed):
    unpushed commits. Primary repositories are never removed, only linked git
    worktrees (then `git worktree prune`) and secondary jj workspaces
    (`jj workspace forget` first).
-7. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
+7. **Ignored files.** A checkout (and any nested linked worktree) holding files its
+   ignore rules hide is kept ("contains ignored files; marker lacks ignored_ok"),
+   because clean/pushed says nothing about them. The owner attests they are
+   regenerable with `"ignored_ok": true` in the marker.
+8. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
    refused (at `mark`, at evaluation and at removal); a symlink is never traversed.
    Deny-list paths, including globs, also apply to everything inside a marked folder.
    Nested primary git/jj repositories inside a marked folder keep it too.
-8. **Filesystem boundary**: folders containing another mounted filesystem are
+9. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
 
 The size walk doubles as the descendant deny check (names, sequences), which
