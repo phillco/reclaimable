@@ -1670,3 +1670,153 @@ def test_missing_glob_is_not_a_global_veto(env):
     f = make(env, "bucket")
     env.cfg.deny_paths.append(str(env.root / "absent/*/models"))
     assert rc.evaluate(f, env.cfg, env.reg).safe
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"holds": [{"job": "busy"}]},
+        {"job": "busy"},
+        {"session": str(os.getpid())},
+        {"ttl": "99d"},
+        {"move_to": "archive"},
+    ],
+)
+def test_nested_marker_independent_protection(env, marker):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/deep/inner", age_s=30 * DAY, **marker)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+    assert nested.exists()
+
+
+@pytest.mark.parametrize("name", [".reclaimable", ".RECLAIMABLE", ".ReClAiMaBlE"])
+def test_nested_marker_case_variants_protect_ancestor(env, name):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/a/b/inner", age_s=30 * DAY, holds=[{"job": "busy"}])
+    (nested / rc.MARKER).rename(nested / name)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+
+
+def test_expired_nested_marker_can_be_removed_with_ancestor(env):
+    outer = make(env, "outer", age_s=30 * DAY)
+    make(env, "outer/a/b/inner", age_s=30 * DAY)
+    assert rc.evaluate(outer, env.cfg, env.reg).safe
+
+
+def test_nested_marker_uses_its_own_holder_context(env, monkeypatch):
+    outer = make(env, "outer", age_s=30 * DAY)
+    make(env, "outer/inner", age_s=30 * DAY, owner="busy-owner")
+    monkeypatch.setattr(
+        rc, "holder_hold", lambda m, cfg: "busy" if m.owner == "busy-owner" else None
+    )
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason and "held" in v.reason
+
+
+@pytest.mark.parametrize("problem", ["malformed", "symlink", "directory"])
+def test_invalid_nested_marker_fails_closed(env, problem):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    marker = nested / rc.MARKER
+    if problem == "malformed":
+        marker.write_text("not json")
+    else:
+        marker.unlink()
+        if problem == "symlink":
+            marker.symlink_to(outer / rc.MARKER)
+        else:
+            marker.mkdir()
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+
+
+@pytest.mark.parametrize("change", ["hold", "touch"])
+def test_nested_marker_rechecked_before_ancestor_removal(env, change):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert v.safe
+    if change == "hold":
+        m = rc.read_marker(nested)
+        m.holds = [{"job": "busy"}]
+        rc.write_marker(m)
+    else:
+        os.utime(nested / rc.MARKER)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg, floor_pressure=True)
+    assert not ok and "nested marker" in detail
+    assert outer.exists() and nested.exists()
+
+
+def test_outer_ignored_ok_does_not_override_nested_marker(env):
+    main = make_repo_with_remote(env)
+    outer = make(env, "outer", age_s=30 * DAY, ignored_ok=True)
+    nested = outer / "wt"
+    git("worktree", "add", "-q", "--detach", str(nested), cwd=main)
+    (nested / ".gitignore").write_text("private.bin\n")
+    git("add", ".gitignore", cwd=nested)
+    git(
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "ignore",
+        cwd=nested,
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/ignored", cwd=nested)
+    (nested / "private.bin").write_bytes(b"keep")
+    (nested / rc.MARKER).write_text(
+        json.dumps({"owner": "t", "regenerate": "r", "ignored_ok": False})
+    )
+    old = time.time() - 30 * DAY
+    os.utime(nested / rc.MARKER, (old, old))
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "ignored_ok" in v.reason
+
+
+def test_nested_marker_final_copy_recheck_keeps_source(env, monkeypatch):
+    outer, _ = make_movable(env)
+    nested = make(env, "scratch1/inner", age_s=30 * DAY)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert v.safe
+
+    def copy_then_hold(*args, **kwargs):
+        marker = rc.read_marker(nested)
+        marker.holds = [{"job": "busy"}]
+        rc.write_marker(marker)
+        return True, "copied fixture"
+
+    monkeypatch.setattr(rc, "move_and_verify", copy_then_hold)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "nested marker" in detail and "held" in detail
+    assert outer.exists() and nested.exists()
+
+
+def test_nested_marker_own_deny_exact_keeps_ancestor(env):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    env.cfg.deny_exact.append(str(nested))
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason and "broad folder" in v.reason
+
+
+def test_nested_marker_ignored_ok_independent_and_inherited(env, monkeypatch):
+    outer = make(env, "outer", age_s=30 * DAY, ignored_ok=True)
+    nested = make(env, "outer/inner", age_s=30 * DAY, ignored_ok=False)
+    repo = nested / "wt"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: fixture")
+    monkeypatch.setattr(
+        rc, "repo_state", lambda p: ("git-linked", None) if p == repo else (None, None)
+    )
+    monkeypatch.setattr(
+        rc,
+        "ignored_files",
+        lambda p, kind: "contains ignored files; marker lacks ignored_ok",
+    )
+    assert not rc.evaluate(outer, env.cfg, env.reg).safe
+    (nested / rc.MARKER).unlink()
+    assert rc.evaluate(outer, env.cfg, env.reg).safe

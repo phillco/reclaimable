@@ -495,8 +495,8 @@ class Marker:
         return data
 
 
-def read_marker(folder: Path) -> Marker:
-    path = folder / MARKER
+def read_marker(folder: Path, *, marker_path: Path | None = None) -> Marker:
+    path = marker_path if marker_path is not None else folder / MARKER
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise ValueError("marker is not a JSON object")
@@ -1268,6 +1268,7 @@ class Walk:
     problem: str | None
     repos: list[Path]
     crossed: list[Path] = field(default_factory=list)
+    markers: list[Path] = field(default_factory=list)
 
 
 def walk(
@@ -1278,6 +1279,7 @@ def walk(
     size = files = 0
     repos: list[Path] = []
     crossed: list[Path] = []
+    markers: list[Path] = []
     seen: set[tuple[int, int]] = set()
     deadline = time.monotonic() + limit_s
     dev = folder.lstat().st_dev
@@ -1311,6 +1313,12 @@ def walk(
             else:
                 size += st.st_blocks * 512
             rel = Path(e.path).relative_to(folder).parts
+            if fold(e.name) == fold(MARKER) and path_key(d) != path_key(folder):
+                if not stat.S_ISREG(st.st_mode):
+                    return Walk(
+                        None, files, f"invalid nested marker {'/'.join(rel)}", repos
+                    )
+                markers.append(Path(e.path))
             hit_path = any(path_match(e.path, pattern) for pattern in patterns)
             if hit_path or (st.st_dev, st.st_ino) in protected:
                 return Walk(None, files, f"contains deny-listed {'/'.join(rel)}", repos)
@@ -1327,7 +1335,7 @@ def walk(
                     stack.append(Path(e.path))
                 else:
                     crossed.append(Path(e.path))
-    return Walk(size, files, None, sorted(set(repos)), crossed)
+    return Walk(size, files, None, sorted(set(repos)), crossed, markers)
 
 
 @dataclass
@@ -1418,6 +1426,36 @@ def tree_problem(
             f"contains another filesystem at {w.crossed[0].relative_to(folder)}",
             None,
         )
+    nested_markers: dict[str, Marker] = {}
+    for marker_path in w.markers:
+        label = f"nested marker {marker_path.relative_to(folder)}"
+        key = path_key(marker_path.parent)
+        if key in nested_markers:
+            return f"{label}: ambiguous marker spelling", None
+        try:
+            nested = read_marker(marker_path.parent, marker_path=marker_path)
+            if nested.holds:
+                return f"{label}: held", None
+            if nested.job or nested.session:
+                return f"{label}: job/session requires independent removal", None
+            if now() - nested.mtime < nested.ttl_seconds:
+                return f"{label}: not expired", None
+        except (OSError, ValueError, TypeError) as e:
+            return f"{label}: unreadable or invalid ({e})", None
+        if nested.move_to or (cfg.move_root and nested.effective_kind != "cache"):
+            return f"{label}: move requires independent removal", None
+        denied = deny_reason(nested.folder, cfg)
+        if denied:
+            return f"{label}: refused: {denied}", None
+        hold = holder_hold(nested, cfg)
+        if hold:
+            return f"{label}: held: {hold}", None
+        nested_problem, _ = tree_problem(
+            nested.folder, nested, cfg, Walk(0, 0, None, [])
+        )
+        if nested_problem:
+            return f"{label}: {nested_problem}", None
+        nested_markers[key] = nested
     repo, problem = repo_state(folder)
     if problem:
         return f"worktree {problem}", repo
@@ -1437,7 +1475,18 @@ def tree_problem(
         nested_kind, problem = repo_state(nested)
         if problem:
             return f"nested repo {nested.relative_to(folder)} {problem}", repo
-        if nested_kind in ("git-linked", "jj-secondary") and not ignored_ok:
+        own_marker = next(
+            (
+                nested_markers[path_key(ancestor)]
+                for ancestor in (nested, *nested.parents)
+                if path_key(ancestor) in nested_markers
+            ),
+            None,
+        )
+        nested_ignored_ok = (
+            own_marker.extra.get("ignored_ok") is True if own_marker else ignored_ok
+        )
+        if nested_kind in ("git-linked", "jj-secondary") and not nested_ignored_ok:
             hidden = ignored_files(nested, nested_kind)
             if hidden:
                 return (

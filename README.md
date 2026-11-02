@@ -101,12 +101,20 @@ completed keeps the folder (fail closed):
    ignore rules hide is kept ("contains ignored files; marker lacks ignored_ok"),
    because clean/pushed says nothing about them. The owner attests they are
    regenerable with `"ignored_ok": true` in the marker.
+   An independently marked nested checkout uses its own attestation; an outer
+   marker cannot override it. Unmarked nested checkouts inherit the nearest
+   containing marker's explicit attestation.
 8. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
    refused (at `mark`, at evaluation and at removal); a symlink is never traversed.
    Deny-list paths, including globs, also apply to everything inside a marked folder.
    Nested primary git/jj repositories inside a marked folder keep it too.
 9. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
+10. **Nested markers**: a marker at any depth protects its ancestor unless its
+    own holds, TTL, deny-list, holders and checkout checks permit removal. Marker
+    names are recognised case-folded; malformed, unreadable, symlink or non-file
+    markers keep the ancestor. Nested job/session markers and requested moves
+    require independent removal. Space pressure never overrides a nested TTL.
 
 The size walk doubles as the descendant deny check (names, sequences), which
 applies to every kind, `mirror` included; a walk that times out or hits an unreadable folder keeps the folder.
@@ -117,7 +125,8 @@ holders, open files, folder identity, a fresh `job_done` answer (the
 positive cache is bypassed; open, unknown or error keeps the folder),
 the session decision (pid exact; a non-pid session needs a fresh process-list
 no-match and an elapsed `session_grace`) and the worktree checks (dirty,
-unpushed, primary or nested repos) are re-checked. The TTL clock is recomputed
+unpushed, primary or nested repos), including every nested marker's independent
+protections, are re-checked. The TTL clock is recomputed
 from the fresh marker mtime, job close time and session state, and a folder
 selected for its TTL that is no longer expired (a job reopened and reclosed)
 is kept; folders selected because free space is low are exempt. For a **move** the
