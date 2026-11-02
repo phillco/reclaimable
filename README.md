@@ -8,10 +8,13 @@ launchd/cron/systemd) removes or moves expired folders and frees space
 least-recently-used first when a disk runs low. It only touches folders that pass
 every safety check, and it does nothing until you arm the host.
 
-Single-file Python 3.11+, standard library only.
+Single Go executable for macOS/Linux (amd64/arm64), Go 1.22+. The only library
+dependency is pinned and vendored: `github.com/BurntSushi/toml` v1.4.0.
 
 ```sh
-uv tool install git+https://github.com/OWNER/reclaimable   # or copy ./reclaimable onto PATH
+go build                       # produces ./reclaimable
+mkdir -p ~/.local/bin
+install -m 755 ./reclaimable ~/.local/bin/reclaimable
 reclaimable mark ~/proj/.cache -o mytool -r "mytool build recreates it" -t 3d
 reclaimable ls                  # age, size, TTL, eligibility and why
 reclaimable sweep -n            # dry run
@@ -25,10 +28,12 @@ reclaimable arm                 # real sweeps begin 24 h later
 ```json
 {"owner": "mytool", "ttl": "3d", "regenerate": "mytool build recreates it",
  "kind": "mirror", "job": "1234", "session": "4242", "move_to": "backup:~/parked",
+ "ignored_ok": true,
  "holds": [{"job": "indexer", "path": "sub/dir", "at": 1762000000}]}
 ```
 
-`owner` and `regenerate` are required. `kind` is `cache` (default), `scratch`,
+`owner` and `regenerate` are required (a marker without a non-empty string for each
+is invalid and the folder is kept); `ignored_ok` is optional (see Safety model). `kind` is `cache` (default), `scratch`,
 `worktree`, `mirror` or `staged`. **Last use is the marker's mtime**: owners run
 `reclaimable touch PATH` (or `touch PATH/.reclaimable`) whenever they use the
 folder. Unknown fields are preserved. Default TTLs (`default_ttls` overrides):
@@ -49,6 +54,10 @@ reclaimable status [-l N]
 reclaimable arm [-x]                        # -x disarms
 ```
 
+Paths are always normalised to absolute lexical paths (symlinks are never resolved,
+they are refused) at `mark`, in the registry and at evaluation; a relative path found
+in the registry is ignored with a log line, never acted on.
+
 Markers are found by a bounded scan of `roots` (daily, or `-S`) and registered
 when created with `mark`. State lives in `~/.local/state/reclaimable/`, the log in
 `~/.local/log/reclaimable.log`, the armed flag in `~/.config/reclaimable/armed`.
@@ -62,6 +71,17 @@ completed keeps the folder (fail closed):
    the root, home, volume roots, `~/Documents` and other broad folders (exact match),
    anything inside a `.git`/`.jj` directory, `~/.ssh`, `~/.gnupg`, `*.photoslibrary`.
    The config can only **add** to the deny-lists.
+   Matching is conservative: names and paths are compared case-folded and
+   Unicode-normalised (case variants and NFC/NFD spellings are the same), the macOS
+   `/System/Volumes/Data` firmlink prefix is removed component by component from
+   every path and pattern, including mixed-case and Unicode-equivalent spellings.
+   Safety comparisons use the same absolute canonical form; filesystem operations
+   and content inventories retain their original names. Protected
+   paths and their ancestors are also compared by filesystem identity (device and
+   inode), including glob matches and descendants found while walking a marked
+   folder. Glob expansion compares every component case-folded and normalised;
+   unreadable glob directories keep the folder. This
+   over-protects on case-sensitive volumes on purpose.
 2. **Holds**: any entry in `holds` keeps the folder.
 3. **Live readers**: `lsof +D` (90 s cap) must show nothing open under it.
 4. **Holders** (config): external commands and lease directories that can veto a
@@ -80,24 +100,58 @@ completed keeps the folder (fail closed):
    unpushed commits. Primary repositories are never removed, only linked git
    worktrees (then `git worktree prune`) and secondary jj workspaces
    (`jj workspace forget` first).
-7. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
+7. **Ignored files.** A checkout (and any nested linked worktree) holding files its
+   ignore rules hide is kept ("contains ignored files; marker lacks ignored_ok"),
+   because clean/pushed says nothing about them. The owner attests they are
+   regenerable with `"ignored_ok": true` in the marker.
+   An independently marked nested checkout uses its own attestation; an outer
+   marker cannot override it. Unmarked nested checkouts inherit the nearest
+   containing marker's explicit attestation.
+8. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
    refused (at `mark`, at evaluation and at removal); a symlink is never traversed.
    Deny-list paths, including globs, also apply to everything inside a marked folder.
    Nested primary git/jj repositories inside a marked folder keep it too.
-8. **Filesystem boundary**: folders containing another mounted filesystem are
+9. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
+10. **Replacement races**: discovery, safety walks, marker reads, hashing, copying
+    and recursive deletion open directories and files relative to checked
+    descriptors, without following symlinks. Opened device/inode identities must
+    match the inspected entries; replacements, unsupported file types and
+    incomplete checks keep the source. Recursive removal never follows a swapped
+    child symlink outside the marked tree.
+10. **Nested markers**: a marker at any depth protects its ancestor unless its
+    own holds, TTL, deny-list, holders and checkout checks permit removal. Marker
+    names are recognised case-folded; malformed, unreadable, symlink or non-file
+    markers keep the ancestor. Nested job/session markers and requested moves
+    require independent removal. Space pressure never overrides a nested TTL.
 
 The size walk doubles as the descendant deny check (names, sequences), which
 applies to every kind, `mirror` included; a walk that times out or hits an unreadable folder keeps the folder.
 
 Immediately before removal, **under the same lock `hold` takes**, the marker is
 re-read (touched or held since evaluation means keep), and the deny-list,
-holders, open files, folder identity and the worktree checks (dirty,
-unpushed, primary or nested repos) are re-checked. For a **move** the
-folder is copied (local, or `rsync` to `host:path`), every file is sha256-verified
+holders, open files, folder identity, a fresh `job_done` answer (the
+positive cache is bypassed; open, unknown or error keeps the folder),
+the session decision (pid exact; a non-pid session needs a fresh process-list
+no-match and an elapsed `session_grace`) and the worktree checks (dirty,
+unpushed, primary or nested repos), including every nested marker's independent
+protections, are re-checked. The TTL clock is recomputed
+from the fresh marker mtime, job close time and session state, and a folder
+selected for its TTL that is no longer expired (a job reopened and reclosed)
+is kept; folders selected because free space is low are exempt. For a **move** the
+folder is read into a private snapshot through checked descriptors, copied
+locally or streamed to `host:path`, and every file is sha256-verified
 against the source, then the checks above run again and the source's content is
 re-hashed; a hold, new lease, reader or changed file during the copy keeps the
-source. Removal renames the folder aside, then deletes it.
+source. Destinations must be new; creation refuses symlink ancestors and existing
+files. Moves refuse extended attributes and resource forks that the byte-copy
+protocol cannot preserve and verify (automatically attached system provenance is
+excluded). Remote moves require Python 3 on the destination host; the archive receiver
+and hash verifier use the same descriptor-relative protections. A failed copy may
+leave a partial destination for inspection, while retaining the source.
+Removal renames the folder aside through its checked parent descriptor, verifies
+its identity again, then deletes it through descriptors. These checks prevent
+symlink redirection; they do not freeze a tree against concurrent writers.
 
 **Dry-run until armed.** Sweeps act only once the host is armed (`reclaimable arm`)
 and 24 h have passed. `sweep -n` never acts; `sweep -A` acts immediately but still
@@ -106,6 +160,10 @@ requires the armed flag.
 **Space floor.** Below the host's floor, safe folders go least-recently-used first,
 even before their TTL, until the target. Default floor 30 GB, target floor + 20 GB;
 only the home volume has a floor unless `volume_floors` names others.
+Sizes count each hardlinked file once. The floor plan is an estimate: when armed,
+the sweep re-measures real free space before every pressure removal and stops at
+the target. An optimistic size estimate cannot stop an armed sweep early; later
+safe candidates remain in LRU order until measured free space reaches the target.
 
 ## Configuration
 
@@ -128,7 +186,8 @@ deny_exact = ["~/src"]                        # the folder itself may never be m
 # Non-numeric sessions can't be observed reliably (their id may never appear in a command
 # line). Unset (default): a session the process list doesn't show is "unknown" and keeps the
 # folder. With a grace, such a session counts as gone only if the job is closed AND now >=
-# the job's close time + grace; no close time (job_done printed none) keeps the folder.
+# the job's close time + grace. If job_done prints no close time, the first time the janitor
+# saw the job closed is used instead.
 # Numeric pids are always checked exactly; a process-list hit always blocks.
 session_grace = "72h"
 
@@ -176,12 +235,55 @@ exclude_list_format = "{path}"       # one line per folder; e.g. "path {path}"
 remote_command = ["ssh", "{host}", "{script}"]
 ```
 
-## Tests
+## Build and tests
 
 ```sh
-uv run --no-project --with pytest python -m pytest
+go build                       # uses vendor/, no network needed
+go test ./...                  # parity requires Python 3.11+
+go vet ./...
+gofmt -l *.go
+(cd python && uv run --no-project --with pytest python -m pytest)
+uv run --no-project --with pytest python -m pytest python/upstream/tests
 ```
+
+Copy `completions/reclaimable.fish` into a Fish completion directory. The binary
+name, subcommands and flags remain `reclaimable`.
+
+The original Python reference and 75 cases remain unchanged under `python/`.
+The separate `python/upstream/` snapshot includes later reviewed safeguards and
+183 cases. `PORT-NOTES.md` maps every Python test function to Go. Tests use temporary
+trees/homes/state for destructive scenarios, and local shims for remote protocols.
+Parity compares outputs, exits and resulting state; only fixture roots, clocks
+and free-space measurements are normalized.
+
+## Differences from the Python version
+
+- Help layout, parser/OS/JSON diagnostics, JSON key order and escaping differ.
+  Flags, TOML keys, marker/state schemas and ordinary command exits are compatible.
+- Unicode comparison uses pinned Unicode 16.0.0 data. Another Python database can
+  differ for newly assigned characters. Regenerate with
+  `python3 tools/generate_unicode.py` using a matching database, or verify using
+  `python3 tools/generate_unicode.py --check`. See `UNICODE-LICENSE.txt`.
+- Malformed lease/claim objects and holder-directory settings keep data instead
+  of raising exceptions. Size overflow is rejected; invalid/nonfinite arming times
+  and descendant stat failures keep data. File/directory changes during hashing
+  veto verification. Timeouts also bound process groups/pipes.
+- Descriptor operations support macOS/Linux on amd64/arm64. Other architectures
+  keep data. Linux symlink metadata inspection needs procfs; unavailable inspection
+  keeps the source. No native copy utility is required.
+- Local copies retain full mode bits/macOS flags beyond the updated Python copy's
+  ordinary permission bits. Both refuse unverifiable extended payloads, including
+  resource forks, except system provenance.
+- Remote export uses verified TAR in an unlinked temporary descriptor; Python
+  first builds a private snapshot tree. Both use the same descriptor-safe receiver
+  and JSON inventory; malformed/duplicate inventories are refused.
+- The unreadable-claim test isolates claims from an earlier live lease, fixing a
+  masking assertion while preserving its intended scenario.
+
+Local runtime needs no Python. External `lsof`, `pgrep`, `git` and `jj` retain
+their existing roles; remote endpoints need Python 3 and the configured remote
+command. Building, installing and running tests do not arm the real host.
 
 ## License
 
-MIT
+MIT; vendored TOML and generated Unicode data retain their included licenses.

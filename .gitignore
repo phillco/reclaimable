@@ -6,3 +6,6 @@ dist/
 *.egg-info/
 
 /reclaimable
+
+# Local runbooks
+/.*/napkin.md

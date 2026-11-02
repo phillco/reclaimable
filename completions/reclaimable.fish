@@ -1,4 +1,4 @@
-# reclaimable: janitor for folders marked with .reclaimable
+# reclaimable Go binary: janitor for folders marked with .reclaimable
 set -l cmds mark touch hold release ls sweep status arm
 complete -c reclaimable -f
 complete -c reclaimable -s h -l help -d 'Show help'
