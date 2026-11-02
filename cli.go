@@ -45,6 +45,8 @@ func (a *App) main(argv []string) int {
 		return a.cmdLS(args, cfg)
 	case "sweep":
 		return a.sweep(args, cfg)
+	case "maintenance":
+		return a.cmdMaintenance(args, cfg)
 	case "status":
 		return a.cmdStatus(args, cfg)
 	case "arm":
@@ -83,6 +85,10 @@ func commandOptions(cmd string) map[string]optionSpec {
 		add("t", "target", true)
 		add("S", "scan", false)
 		add("v", "verbose", false)
+	case "maintenance":
+		add("n", "dry-run", false)
+		add("o", "only", true)
+		add("f", "force-due", false)
 	case "status":
 		add("l", "lines", true)
 	case "arm":
@@ -103,7 +109,7 @@ func parseArgs(argv []string) (Args, bool, error) {
 		return a, true, nil
 	}
 	valid := false
-	for _, cmd := range []string{"mark", "touch", "hold", "release", "ls", "sweep", "status", "arm"} {
+	for _, cmd := range []string{"mark", "touch", "hold", "release", "ls", "sweep", "maintenance", "status", "arm"} {
 		if argv[0] == cmd {
 			valid = true
 		}
@@ -193,6 +199,11 @@ func parseArgs(argv []string) (Args, bool, error) {
 	a.MoveTo = ptr("move-to")
 	a.Subpath = ptr("path")
 	a.Owner = values["owner"]
+	a.Only = values["only"]
+	if only, present := values["only"]; present && only == "" {
+		return a, false, fmt.Errorf("--only requires a nonempty hook name")
+	}
+	a.ForceDue = flags["force-due"]
 	a.JSON = flags["json"]
 	a.Quick = flags["quick"]
 	a.Scan = flags["scan"]
@@ -268,10 +279,10 @@ func parseArgs(argv []string) (Args, bool, error) {
 
 func (a *App) help(cmd string) {
 	if cmd == "" {
-		fmt.Fprintln(a.Out, "usage: reclaimable [-h] COMMAND ...\n\nJanitor for regenerable folders marked with `.reclaimable`.\n\ncommands:\n  mark     create/update a folder's .reclaimable marker\n  touch    mark folders used now\n  hold     declare a job is reading the folder\n  release  drop a job's hold\n  ls       list markers with age, size, TTL and eligibility\n  sweep    the janitor (dry-run unless this host is armed)\n  status   armed state, free space, last sweep, log tail\n  arm      arm this host (scheduled sweeps act after 24h)\n\noptions:\n  -h, --help  show this help message and exit\n\nConfig: ~/.config/reclaimable/config.toml (see README)")
+		fmt.Fprintln(a.Out, "usage: reclaimable [-h] COMMAND ...\n\nJanitor for regenerable folders marked with `.reclaimable`.\n\ncommands:\n  mark     create/update a folder's .reclaimable marker\n  touch    mark folders used now\n  hold     declare a job is reading the folder\n  release  drop a job's hold\n  ls       list markers with age, size, TTL and eligibility\n  sweep    the janitor (dry-run unless this host is armed)\n  maintenance  run configured native cache hooks\n  status   armed state, free space, last sweep, log tail\n  arm      arm this host (scheduled sweeps act after 24h)\n\noptions:\n  -h, --help  show this help message and exit\n\nConfig: ~/.config/reclaimable/config.toml (see README)")
 		return
 	}
-	usage := map[string]string{"mark": "PATH -o OWNER [-t TTL] [-r REGEN] [-k KIND] [-j JOB] [-s SESSION] [-m MOVE_TO]", "touch": "PATH...", "hold": "PATH JOB [-p SUBPATH]", "release": "PATH JOB [-p SUBPATH]", "ls": "[ROOTS...] [-j] [-q] [-S]", "sweep": "[-n | -A] [-f FLOOR] [-t TARGET] [-S] [-v]", "status": "[-l LINES]", "arm": "[-x]"}
+	usage := map[string]string{"mark": "PATH -o OWNER [-t TTL] [-r REGEN] [-k KIND] [-j JOB] [-s SESSION] [-m MOVE_TO]", "touch": "PATH...", "hold": "PATH JOB [-p SUBPATH]", "release": "PATH JOB [-p SUBPATH]", "ls": "[ROOTS...] [-j] [-q] [-S]", "sweep": "[-n | -A] [-f FLOOR] [-t TARGET] [-S] [-v]", "maintenance": "[-n] [-o NAME] [-f]", "status": "[-l LINES]", "arm": "[-x]"}
 	fmt.Fprintf(a.Out, "usage: reclaimable %s [-h] %s\n\noptions:\n  -h, --help  show this help message and exit\n", cmd, usage[cmd])
 	specs := commandOptions(cmd)
 	keys := []string{}
@@ -556,11 +567,18 @@ func (a *App) sweep(args Args, cfg *Config) int {
 			kept = append(kept, a.row(v))
 		}
 	}
+	maintenance, maintenanceFailed, e := a.runMaintenance(args, cfg)
+	if e != nil {
+		return a.fail(e, 1)
+	}
 	free, e := a.FreeBytes(a.Home)
 	if e != nil {
 		return a.fail(e, 1)
 	}
 	summary := map[string]any{"at": a.Now(), "host": a.Hostname(), "mode": mode, "armed": armed, "markers": len(vs), "free": free, "floor": cfg.Floor, "target": cfg.Target, "actions": done, "blocked": blocked, "kept": kept, "scan_complete": reg["last_scan_complete"]}
+	if len(cfg.Maintenance) > 0 {
+		summary["maintenance"] = maintenance
+	}
 	if e := writeJSON(a.LastSweep, summary); e != nil {
 		return a.fail(e, 1)
 	}
@@ -579,6 +597,9 @@ func (a *App) sweep(args Args, cfg *Config) int {
 				fmt.Fprintf(a.Out, "  keep %s: %s\n", v.Folder, v.Reason)
 			}
 		}
+	}
+	if maintenanceFailed {
+		return 1
 	}
 	return 0
 }
@@ -810,7 +831,7 @@ func (a *App) cmdStatus(args Args, cfg *Config) int {
 		suffix = " (depth/time-limited; marked folders are always registered)"
 	}
 	fmt.Fprintf(a.Out, "registered markers: %d  last scan: %s%s\n", len(dict(reg["markers"])), when, suffix)
-	if last != nil {
+	if last != nil && last["at"] != nil {
 		actions, _ := last["actions"].([]any)
 		kept, ok := last["kept"].([]any)
 		if !ok {

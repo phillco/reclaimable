@@ -52,6 +52,8 @@ type App struct {
 	DefaultTTL                                                                     map[string]string
 }
 type Config struct {
+	Maintenance                     []Maintenance
+	MaintenanceArmed                bool
 	Roots                           []string
 	Floor, Target                   int64
 	MoveRoot                        string
@@ -116,6 +118,8 @@ type Planned struct {
 	Why string
 }
 type Args struct {
+	Only                                            string
+	ForceDue                                        bool
 	Command                                         string
 	Path, Owner                                     string
 	TTL, Regen, Kind, Job, Session, MoveTo, Subpath *string
