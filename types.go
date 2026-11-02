@@ -36,6 +36,8 @@ type App struct {
 	SessionRunning                                                                 func(string) string // alive, gone, no-match, unknown
 	RepoState                                                                      func(string) (string, string)
 	Lstat                                                                          func(string) (os.FileInfo, error)
+	StatAt                                                                         func(*os.File, string, bool) (os.FileInfo, error)
+	FSBefore                                                                       func(string, string, string)
 	Rename                                                                         func(string, string) error
 	FileHashes                                                                     func(string) (map[string]string, error)
 	MoveAndVerify                                                                  func(string, string, []string, map[string]string) (bool, string)
@@ -130,6 +132,7 @@ func newApp() *App {
 	a.Hostname = func() string { h, _ := os.Hostname(); return strings.ToLower(strings.Split(h, ".")[0]) }
 	a.Run = runCommand
 	a.Lstat = os.Lstat
+	a.StatAt = statAt
 	a.Rename = os.Rename
 	a.OpenFiles = a.openFiles
 	a.ProcessCwd = a.processCwd

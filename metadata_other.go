@@ -9,8 +9,9 @@ import (
 )
 
 func accessTime(info os.FileInfo) time.Time { return info.ModTime() }
-func copyMetadata(src, dest string, info os.FileInfo) error {
-	return fmt.Errorf("metadata-preserving local moves are supported on macOS and Linux")
+func copyMetadataFD(src, dest *os.File, info os.FileInfo) error {
+	return fmt.Errorf("descriptor metadata copying is supported on macOS and Linux")
 }
-
-func symlinkCopyArgs(src, dest string) []string { return []string{"/bin/cp", "-pRP", src, dest} }
+func copySymlinkMetadataAt(srcParent *os.File, srcName string, destParent *os.File, destName string, info, destInfo os.FileInfo) error {
+	return fmt.Errorf("descriptor symlink metadata copying is supported on macOS and Linux")
+}

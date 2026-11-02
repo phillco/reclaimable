@@ -617,37 +617,78 @@ func (a *App) ignoredFiles(folder, repo string) string {
 	for _, line := range strings.Split(r.Stdout, "\n") {
 		tracked[line] = true
 	}
+	root, err := openPathDir(folder)
+	if err != nil {
+		return "ignored-file check unavailable"
+	}
+	defer root.Close()
+	rootInfo, err := root.Stat()
+	if err != nil {
+		return "ignored-file check unavailable"
+	}
 	hidden := ""
-	err := filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
+	var descend func(*os.File, string) error
+	descend = func(dir *os.File, relative string) error {
+		entries, err := dir.ReadDir(-1)
 		if err != nil {
 			return err
 		}
-		if path == folder {
-			return nil
-		}
-		if d.IsDir() {
-			if filepath.Dir(path) == folder && (d.Name() == ".jj" || d.Name() == ".git") {
-				return filepath.SkipDir
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, entry := range entries {
+			name := entry.Name()
+			rel := filepath.Join(relative, name)
+			st, err := a.StatAt(dir, name, false)
+			if err != nil {
+				return err
 			}
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			// os.walk lists a directory symlink among dirs and does not follow it.
-			if info, err := os.Stat(path); err == nil && info.IsDir() {
+			if st.IsDir() {
+				if relative == "" && (name == ".jj" || name == ".git") {
+					continue
+				}
+				if device(st) != device(rootInfo) {
+					return fmt.Errorf("another filesystem")
+				}
+				a.fsBefore("ignored-descend", filepath.Join(folder, relative), name)
+				next, err := openAt(dir, name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
+				if err != nil {
+					return err
+				}
+				opened, err := next.Stat()
+				if err != nil {
+					next.Close()
+					return err
+				}
+				if !sameIdentity(st, opened) {
+					next.Close()
+					return fmt.Errorf("directory replaced")
+				}
+				err = descend(next, rel)
+				closeErr := next.Close()
+				if err != nil {
+					return err
+				}
+				if closeErr != nil {
+					return closeErr
+				}
+				if hidden != "" {
+					return nil
+				}
+				continue
+			}
+			if st.Mode()&os.ModeSymlink != 0 {
+				// Classify directory links as os.walk does, while never entering them.
+				if target, err := a.StatAt(dir, name, true); err == nil && target.IsDir() {
+					continue
+				}
+			}
+			if rel != markerName && !tracked[rel] {
+				hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
 				return nil
 			}
 		}
-		rel, err := filepath.Rel(folder, path)
-		if err != nil {
-			return err
-		}
-		if rel != markerName && !tracked[rel] {
-			hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
-			return filepath.SkipAll
-		}
 		return nil
-	})
-	if err != nil {
+	}
+	if err := descend(root, ""); err != nil {
 		return "ignored-file check unavailable"
 	}
 	return hidden
@@ -661,45 +702,65 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(out)
 	return out
 }
-func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) Walk {
-	w := Walk{}
-	size := int64(0)
-	root, err := a.Lstat(folder)
+func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (w Walk) {
+	repos := map[string]bool{}
+	defer func() { w.Repos = sortedKeys(repos) }()
+	inspected, err := a.Lstat(folder)
 	if err != nil {
 		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
 		return w
 	}
-	dev := device(root)
+	if !inspected.IsDir() {
+		w.Problem = "unreadable " + folder + ": not a real directory"
+		return w
+	}
+	root, err := openPathDir(folder)
+	if err != nil {
+		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
+		return w
+	}
+	defer root.Close()
+	opened, err := root.Stat()
+	if err != nil {
+		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
+		return w
+	}
+	if device(opened) != device(inspected) || inode(opened) != inode(inspected) {
+		w.Problem = "folder replaced during size walk"
+		return w
+	}
+	dev := device(opened)
 	deadline := time.Now().Add(time.Duration(limit * float64(time.Second)))
 	protected := a.protectedIdentities(cfg)
-	stack := []string{folder}
-	repos := map[string]bool{}
-	seen := map[[2]uint64]bool{}
+	seen := map[FileIdentity]bool{}
 	patterns := make([]string, len(cfg.DenyPaths))
 	for i, p := range cfg.DenyPaths {
 		patterns[i] = a.expand(p)
 	}
-	for len(stack) > 0 {
+	size := int64(0)
+	type childDir struct {
+		name, path string
+		info       os.FileInfo
+	}
+	var descend func(*os.File, string) bool
+	descend = func(dir *os.File, logical string) bool {
 		if time.Now().After(deadline) {
 			w.Problem = "size walk timed out"
-			w.Repos = sortedKeys(repos)
-			return w
+			return false
 		}
-		d := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		entries, err := os.ReadDir(d)
+		entries, err := dir.ReadDir(-1)
 		if err != nil {
-			w.Problem = fmt.Sprintf("unreadable %s: %s", d, err)
-			w.Repos = sortedKeys(repos)
-			return w
+			w.Problem = fmt.Sprintf("unreadable %s: %s", logical, err)
+			return false
 		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		children := []childDir{}
 		for _, e := range entries {
-			p := filepath.Join(d, e.Name())
-			st, err := a.Lstat(p)
+			p := filepath.Join(logical, e.Name())
+			st, err := a.StatAt(dir, e.Name(), false)
 			if err != nil {
 				w.Problem = fmt.Sprintf("unreadable %s: %s", p, err)
-				w.Repos = sortedKeys(repos)
-				return w
+				return false
 			}
 			w.Files++
 			hardlinked := false
@@ -707,7 +768,7 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 				hardlinked = stat.Nlink > 1 && !st.IsDir()
 			}
 			if hardlinked {
-				key := [2]uint64{device(st), inode(st)}
+				key := FileIdentity{device(st), inode(st)}
 				if !seen[key] {
 					seen[key] = true
 					size += allocated(st)
@@ -715,12 +776,15 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 			} else {
 				size += allocated(st)
 			}
-			rel, _ := filepath.Rel(folder, p)
+			rel, err := filepath.Rel(folder, p)
+			if err != nil {
+				w.Problem = "unreadable " + p + ": " + err.Error()
+				return false
+			}
 			absolute, err := filepath.Abs(p)
 			if err != nil {
 				w.Problem = "unreadable " + p + ": " + err.Error()
-				w.Repos = sortedKeys(repos)
-				return w
+				return false
 			}
 			hitPath := false
 			for _, pattern := range patterns {
@@ -731,28 +795,60 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 			}
 			if hitPath || protected[FileIdentity{device(st), inode(st)}] {
 				w.Problem = "contains deny-listed " + rel
-				w.Repos = sortedKeys(repos)
-				return w
+				return false
 			}
 			if checkNames && denyNameHit(strings.Split(rel, string(filepath.Separator)), cfg) != "" {
 				w.Problem = "contains deny-listed " + rel
-				w.Repos = sortedKeys(repos)
-				return w
+				return false
 			}
-			if (fold(e.Name()) == ".git" || fold(e.Name()) == ".jj") && d != folder {
-				repos[d] = true
+			if (fold(e.Name()) == ".git" || fold(e.Name()) == ".jj") && logical != folder {
+				repos[logical] = true
 			}
 			if st.IsDir() {
 				if device(st) == dev {
-					stack = append(stack, p)
+					children = append(children, childDir{e.Name(), p, st})
 				} else {
 					w.Crossed = append(w.Crossed, p)
 				}
 			}
 		}
+		for i := len(children) - 1; i >= 0; i-- {
+			child := children[i]
+			if a.FSBefore != nil {
+				a.FSBefore("walk-descend", logical, child.name)
+			}
+			next, err := openAt(dir, child.name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
+			if err != nil {
+				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, err)
+				return false
+			}
+			actual, err := next.Stat()
+			if err != nil {
+				next.Close()
+				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, err)
+				return false
+			}
+			if !actual.IsDir() || device(actual) != dev || device(actual) != device(child.info) || inode(actual) != inode(child.info) {
+				next.Close()
+				w.Problem = "directory replaced during size walk: " + child.path
+				return false
+			}
+			ok := descend(next, child.path)
+			closeErr := next.Close()
+			if !ok {
+				return false
+			}
+			if closeErr != nil {
+				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, closeErr)
+				return false
+			}
+		}
+		return true
+	}
+	if !descend(root, folder) {
+		return w
 	}
 	w.Size = &size
-	w.Repos = sortedKeys(repos)
 	return w
 }
 

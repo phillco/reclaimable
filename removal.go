@@ -14,62 +14,99 @@ import (
 )
 
 func (a *App) fileHashes(root string) (map[string]string, error) {
-	out := map[string]string{}
-	rootInfo, err := os.Lstat(root)
+	dir, err := openPathDir(root)
 	if err != nil {
 		return nil, err
 	}
-	if !rootInfo.IsDir() {
-		return nil, fmt.Errorf("not a real directory: %s", root)
+	defer dir.Close()
+	info, err := dir.Stat()
+	if err != nil {
+		return nil, err
 	}
-	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	rootDev := device(info)
+	out := map[string]string{}
+	var visit func(*os.File, string, string) error
+	visit = func(parent *os.File, relative, logical string) error {
+		entries, err := parent.ReadDir(-1)
 		if err != nil {
 			return err
 		}
-		if p == root {
-			return nil
-		}
-		if d.Name() == ".DS_Store" && !d.IsDir() {
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(p)
+		for _, entry := range entries {
+			name := entry.Name()
+			st, err := a.StatAt(parent, name, false)
 			if err != nil {
 				return err
 			}
-			out[rel] = "link:" + link
-			return nil
+			if name == ".DS_Store" && !st.IsDir() {
+				continue
+			}
+			rel := filepath.Join(relative, name)
+			path := filepath.Join(logical, name)
+			a.fsBefore("hash-entry", logical, name)
+			switch {
+			case st.Mode()&os.ModeSymlink != 0:
+				target, err := readlinkAt(parent, name)
+				if err != nil {
+					return err
+				}
+				fresh, err := a.StatAt(parent, name, false)
+				if err != nil || !sameIdentity(st, fresh) {
+					return fmt.Errorf("entry changed during hashing: %s", path)
+				}
+				out[rel] = "link:" + target
+			case st.IsDir():
+				if device(st) != rootDev {
+					return fmt.Errorf("hash walk crosses filesystem at %s", path)
+				}
+				a.fsBefore("hash-descend", logical, name)
+				child, err := openAt(parent, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+				if err != nil {
+					return err
+				}
+				opened, err := child.Stat()
+				if err != nil || !sameIdentity(st, opened) {
+					child.Close()
+					return fmt.Errorf("directory changed during hashing: %s", path)
+				}
+				err = visit(child, rel, path)
+				child.Close()
+				if err != nil {
+					return err
+				}
+			case st.Mode().IsRegular():
+				child, err := openAt(parent, name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+				if err != nil {
+					return err
+				}
+				opened, err := child.Stat()
+				if err != nil || !sameIdentity(st, opened) || !opened.Mode().IsRegular() {
+					child.Close()
+					return fmt.Errorf("file changed during hashing: %s", path)
+				}
+				h := sha256.New()
+				_, err = io.Copy(h, child)
+				after, statErr := child.Stat()
+				closeErr := child.Close()
+				if err != nil {
+					return err
+				}
+				if statErr != nil {
+					return statErr
+				}
+				if closeErr != nil {
+					return closeErr
+				}
+				if after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
+					return fmt.Errorf("file changed during hashing: %s", path)
+				}
+				out[rel] = fmt.Sprintf("%x", h.Sum(nil))
+			default:
+				return fmt.Errorf("cannot hash special file %s", path)
+			}
 		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("cannot hash special file %s", p)
-		}
-		f, err := os.Open(p)
-		if err != nil {
-			return err
-		}
-		h := sha256.New()
-		_, err = io.Copy(h, f)
-		closeErr := f.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		out[rel] = fmt.Sprintf("%x", h.Sum(nil))
 		return nil
-	})
+	}
+	err = visit(dir, "", root)
 	return out, err
 }
 
@@ -228,173 +265,94 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 	}
 	return true, prefix + dest
 }
-func (a *App) copyTree(src, dest string) error {
-	info, err := os.Lstat(src)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("not a real directory: %s", src)
-	}
-	if err = os.Mkdir(dest, 0700); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.Name() == ".DS_Store" {
-			continue
-		}
-		from, to := filepath.Join(src, entry.Name()), filepath.Join(dest, entry.Name())
-		st, err := os.Lstat(from)
-		if err != nil {
-			return err
-		}
-		switch {
-		case st.Mode()&os.ModeSymlink != 0:
-			// Native cp can set symlink timestamps and flags without following
-			// the target, which the Go 1.22 os API cannot express.
-			fromAbs, err := filepath.Abs(from)
-			if err != nil {
-				return err
-			}
-			toAbs, err := filepath.Abs(to)
-			if err != nil {
-				return err
-			}
-			res := a.Run(symlinkCopyArgs(fromAbs, toAbs), 60, "", nil)
-			if res.Err != nil || res.Timeout || res.Code != 0 {
-				return fmt.Errorf("symlink metadata copy failed: %s", strings.TrimSpace(res.Stderr))
-			}
-		case st.IsDir():
-			if err = a.copyTree(from, to); err != nil {
-				return err
-			}
-		case st.Mode().IsRegular():
-			f, err := os.Open(from)
-			if err != nil {
-				return err
-			}
-			out, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-			if err != nil {
-				f.Close()
-				return err
-			}
-			_, err = io.Copy(out, f)
-			closeOut := out.Close()
-			closeIn := f.Close()
-			if err != nil {
-				return err
-			}
-			if closeOut != nil {
-				return closeOut
-			}
-			if closeIn != nil {
-				return closeIn
-			}
-			if err = copyMetadata(from, to, st); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("cannot copy special file %s", from)
-		}
-	}
-	return copyMetadata(src, dest, info)
-}
 func (a *App) rmtreeSameDev(path string) ([]string, error) {
-	st, err := a.Lstat(path)
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	parent, err := openPathDir(filepath.Dir(absolute))
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	name := filepath.Base(absolute)
+	st, err := a.StatAt(parent, name, false)
 	if err != nil {
 		return nil, err
 	}
 	if !st.IsDir() {
 		return nil, fmt.Errorf("refusing to remove %s: not a real directory", path)
 	}
-	dev := device(st)
+	return a.clearDirectoryAt(parent, name, path, st)
+}
+func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.FileInfo) ([]string, error) {
+	dev := device(want)
 	left := []string{}
-	sameDir := func(p string, want os.FileInfo) bool {
-		got, err := a.Lstat(p)
-		return err == nil && got.IsDir() && device(got) == dev && inode(got) == inode(want)
-	}
-	var clear func(string, os.FileInfo) bool
-	clear = func(d string, want os.FileInfo) bool {
-		if !sameDir(d, want) {
-			left = append(left, d)
-			return false
-		}
-		// Refuse a final-component symlink atomically when opening for enumeration,
-		// then verify the opened directory still has the expected identity.
-		f, err := os.OpenFile(d, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	var clear func(*os.File, string, string, os.FileInfo) bool
+	clear = func(parent *os.File, name, path string, want os.FileInfo) bool {
+		a.fsBefore("remove-open", filepath.Dir(path), name)
+		dir, err := openAt(parent, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
-			left = append(left, d)
+			left = append(left, path)
 			return false
 		}
-		opened, err := f.Stat()
-		if err != nil || !opened.IsDir() || device(opened) != dev || inode(opened) != inode(want) {
-			f.Close()
-			left = append(left, d)
+		defer dir.Close()
+		opened, err := dir.Stat()
+		if err != nil || !sameIdentity(want, opened) || device(opened) != dev {
+			left = append(left, path)
 			return false
 		}
-		entries, err := f.ReadDir(-1)
-		closeErr := f.Close()
-		if err != nil || closeErr != nil {
-			left = append(left, d)
+		entries, err := dir.ReadDir(-1)
+		if err != nil {
+			left = append(left, path)
 			return false
 		}
 		ok := true
-		for _, e := range entries {
-			if !sameDir(d, want) {
-				left = append(left, d)
-				return false
-			}
-			p := filepath.Join(d, e.Name())
-			child, err := a.Lstat(p)
+		for _, entry := range entries {
+			leaf := entry.Name()
+			childPath := filepath.Join(path, leaf)
+			st, err := a.StatAt(dir, leaf, false)
 			if err != nil {
-				left = append(left, p)
+				left = append(left, childPath)
 				ok = false
 				continue
 			}
-			if child.IsDir() {
-				if device(child) != dev {
-					left = append(left, p)
-					ok = false
-					continue
-				}
-				if !clear(p, child) {
-					ok = false
-					continue
-				}
-				if !sameDir(p, child) {
-					left = append(left, p)
-					ok = false
-					continue
-				}
+			if device(st) != dev {
+				left = append(left, childPath)
+				ok = false
+				continue
 			}
-			if !sameDir(d, want) {
-				left = append(left, d)
-				return false
+			if st.IsDir() {
+				if !clear(dir, leaf, childPath, st) {
+					ok = false
+				}
+				continue
 			}
-			if err = os.Remove(p); err != nil {
-				left = append(left, p)
+			a.fsBefore("remove-unlink", path, leaf)
+			if err := unlinkAt(dir, leaf, false); err != nil {
+				left = append(left, childPath)
 				ok = false
 			}
 		}
-		if !sameDir(d, want) {
-			left = append(left, d)
+		if !ok {
 			return false
 		}
-		return ok
-	}
-	if clear(path, st) {
-		if !sameDir(path, st) {
+		fresh, err := a.StatAt(parent, name, false)
+		if err != nil || !sameIdentity(want, fresh) {
 			left = append(left, path)
-		} else if err = os.Remove(path); err != nil {
-			return left, err
+			return false
 		}
+		a.fsBefore("remove-rmdir", filepath.Dir(path), name)
+		if err := unlinkAt(parent, name, true); err != nil {
+			left = append(left, path)
+			return false
+		}
+		return true
 	}
+	clear(parent, name, logical, want)
 	return left, nil
 }
+
 func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]any, floorPressure ...bool) (bool, string) {
 	pressure := len(floorPressure) > 0 && floorPressure[0]
 	if !armed {
@@ -409,6 +367,16 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 	ident, err := a.Lstat(v.Folder)
 	if err != nil {
 		return false, "folder unreadable: " + err.Error()
+	}
+	sourceParent, err := openPathDir(filepath.Dir(v.Folder))
+	if err != nil {
+		return false, "folder parent unreadable: " + err.Error()
+	}
+	defer sourceParent.Close()
+	sourceName := filepath.Base(v.Folder)
+	anchored, err := a.StatAt(sourceParent, sourceName, false)
+	if err != nil || !sameIdentity(ident, anchored) {
+		return false, "folder replaced before descriptor anchoring"
 	}
 	recheck := func(src map[string]string) string {
 		fresh, err := a.readMarker(v.Folder)
@@ -539,18 +507,19 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 			}
 		}
 		trash = filepath.Join(filepath.Dir(v.Folder), "."+filepath.Base(v.Folder)+".reclaimable-trash-"+strconv.FormatInt(int64(a.Now()), 10))
-		if err := a.Rename(v.Folder, trash); err != nil {
+		a.fsBefore("remove-rename", filepath.Dir(v.Folder), sourceName)
+		if err := renameAt(sourceParent, sourceName, sourceParent, filepath.Base(trash)); err != nil {
 			return false, "rename failed: " + err.Error()
 		}
-		st, err := a.Lstat(trash)
+		st, err := a.StatAt(sourceParent, filepath.Base(trash), false)
 		if err != nil || !st.IsDir() {
-			if err := a.Rename(trash, v.Folder); err != nil {
+			if err := renameAt(sourceParent, filepath.Base(trash), sourceParent, sourceName); err != nil {
 				return false, "folder became a symlink; restore failed: " + err.Error()
 			}
 			return false, "folder became a symlink; restored, nothing deleted"
 		}
 		if device(st) != device(ident) || inode(st) != inode(ident) {
-			if err := a.Rename(trash, v.Folder); err != nil {
+			if err := renameAt(sourceParent, filepath.Base(trash), sourceParent, sourceName); err != nil {
 				return false, "folder replaced before rename; restore failed: " + err.Error()
 			}
 			return false, "folder replaced before rename; restored, nothing deleted"
@@ -560,7 +529,7 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 	if !ok {
 		return false, detail
 	}
-	left, err := a.rmtreeSameDev(trash)
+	left, err := a.clearDirectoryAt(sourceParent, filepath.Base(trash), trash, ident)
 	if err != nil {
 		return false, "removal failed: " + err.Error()
 	}
