@@ -933,6 +933,87 @@ func TestIgnoredWorkspaceWalkRejectsChildSwap(t *testing.T) {
 	check(t, safetyRead(t, filepath.Join(victim, "outside.bin")) == "irreplaceable", "victim changed")
 }
 
+func TestSafetyWalksRejectDirectoryReplacementAfterDescent(t *testing.T) {
+	for _, operation := range []string{"ignored", "size"} {
+		for _, replacement := range []string{"directory", "symlink"} {
+			t.Run(operation+"-"+replacement, func(t *testing.T) {
+				e := newTestEnv(t)
+				f := e.make(t, "source", 30*day, map[string][]byte{"sub/tracked.bin": []byte("safe")}, nil)
+				target := filepath.Join(e.Root, "replacement")
+				safetyWrite(t, filepath.Join(target, "ignored.bin"), "irreplaceable")
+				e.A.Run = func([]string, float64, string, []string) Result {
+					return Result{Stdout: "sub/tracked.bin\n"}
+				}
+				swapped := false
+				realStat := e.A.StatAt
+				e.A.StatAt = func(parent *os.File, name string, follow bool) (os.FileInfo, error) {
+					st, err := realStat(parent, name, follow)
+					if name == "tracked.bin" && !swapped {
+						swapped = true
+						must(t, os.Rename(filepath.Join(f, "sub"), filepath.Join(e.Root, "saved-sub")))
+						if replacement == "symlink" {
+							must(t, os.Symlink(target, filepath.Join(f, "sub")))
+						} else {
+							must(t, os.Rename(target, filepath.Join(f, "sub")))
+						}
+					}
+					return st, err
+				}
+				if operation == "ignored" {
+					check(t, e.A.ignoredFiles(f, "jj-secondary") == "ignored-file check unavailable", "late replacement accepted")
+				} else {
+					w := e.A.walk(f, e.Cfg, true, 300)
+					check(t, w.Size == nil && strings.Contains(w.Problem, "replaced"), "late replacement accepted: %+v", w)
+				}
+				check(t, swapped, "swap hook was not reached")
+			})
+		}
+	}
+}
+
+func TestIgnoredWorkspacePrunesCanonicalMetadataNames(t *testing.T) {
+	for _, name := range []string{".GIT", ".JJ", "nested/.GIT"} {
+		t.Run(name, func(t *testing.T) {
+			e := newTestEnv(t)
+			f := e.make(t, "workspace", 30*day, map[string][]byte{name + "/internal": []byte("metadata")}, nil)
+			e.A.Run = func([]string, float64, string, []string) Result { return Result{} }
+			reason := e.A.ignoredFiles(f, "jj-secondary")
+			check(t, (reason == "") == !strings.Contains(name, "/"), "metadata prune for %s: %s", name, reason)
+		})
+	}
+}
+
+func TestIgnoredWorkspaceSymlinksNeverFollowTargets(t *testing.T) {
+	for _, targetKind := range []string{"directory", "file", "missing"} {
+		for _, tracked := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s-tracked=%v", targetKind, tracked), func(t *testing.T) {
+				e := newTestEnv(t)
+				f := e.make(t, "workspace", 30*day, map[string][]byte{}, nil)
+				target := filepath.Join(e.Root, "target")
+				if targetKind == "directory" {
+					must(t, os.Mkdir(target, 0755))
+				} else if targetKind == "file" {
+					safetyWrite(t, target, "irreplaceable")
+				}
+				must(t, os.Symlink(target, filepath.Join(f, ".JJ")))
+				e.A.Run = func([]string, float64, string, []string) Result {
+					if tracked {
+						return Result{Stdout: ".JJ\n"}
+					}
+					return Result{}
+				}
+				realStat := e.A.StatAt
+				e.A.StatAt = func(parent *os.File, name string, follow bool) (os.FileInfo, error) {
+					check(t, !follow, "ignored check followed %s", name)
+					return realStat(parent, name, follow)
+				}
+				reason := e.A.ignoredFiles(f, "jj-secondary")
+				check(t, (reason == "") == tracked, "symlink tracked=%v: %s", tracked, reason)
+			})
+		}
+	}
+}
+
 func TestNestedMarkerIndependentProtection(t *testing.T) {
 	cases := []struct {
 		name   string

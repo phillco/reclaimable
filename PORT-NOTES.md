@@ -44,6 +44,8 @@ cross-compile only (runtime unverified). Unicode matches 29,379 differential cas
 
 Additional regressions cover canonical volume-floor lookup during planning and
 ignored directory symlinks in JJ/Git checkouts. These match the updated reference.
+Safety walks also reject child-directory replacement after descent; JJ metadata
+pruning folds root names while keeping symlink entries subject to tracked checks.
 
 ## Python to Go test mapping
 

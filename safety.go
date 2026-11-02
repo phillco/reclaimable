@@ -638,7 +638,7 @@ func (a *App) ignoredFiles(folder, repo string) string {
 				return err
 			}
 			if st.IsDir() {
-				if relative == "" && (name == ".jj" || name == ".git") {
+				if relative == "" && (fold(name) == ".jj" || fold(name) == ".git") {
 					continue
 				}
 				if device(st) != device(rootInfo) {
@@ -665,6 +665,10 @@ func (a *App) ignoredFiles(folder, repo string) string {
 				}
 				if closeErr != nil {
 					return closeErr
+				}
+				current, err := a.StatAt(dir, name, false)
+				if err != nil || !sameIdentity(st, current) {
+					return fmt.Errorf("directory replaced")
 				}
 				if hidden != "" {
 					return nil
@@ -871,6 +875,11 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 			}
 			if closeErr != nil {
 				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, closeErr)
+				return false
+			}
+			current, err := a.StatAt(dir, child.name, false)
+			if err != nil || !sameIdentity(child.info, current) {
+				w.Problem = "directory replaced during size walk: " + child.path
 				return false
 			}
 		}
