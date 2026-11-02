@@ -49,6 +49,10 @@ reclaimable status [-l N]
 reclaimable arm [-x]                        # -x disarms
 ```
 
+Paths are always normalised to absolute lexical paths (symlinks are never resolved,
+they are refused) at `mark`, in the registry and at evaluation; a relative path found
+in the registry is ignored with a log line, never acted on.
+
 Markers are found by a bounded scan of `roots` (daily, or `-S`) and registered
 when created with `mark`. State lives in `~/.local/state/reclaimable/`, the log in
 `~/.local/log/reclaimable.log`, the armed flag in `~/.config/reclaimable/armed`.

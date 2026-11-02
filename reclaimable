@@ -137,7 +137,9 @@ def say(*args) -> None:
 
 
 def expand(p: str | Path) -> Path:
-    return Path(os.path.normpath(Path(p).expanduser()))
+    """Absolute, lexically normalised path (`~` expanded, relative paths taken from
+    the current directory, `..` collapsed; symlinks are NOT resolved)."""
+    return Path(os.path.abspath(Path(p).expanduser()))
 
 
 def hostname() -> str:
@@ -618,7 +620,17 @@ def discover(
             reg["last_scan_complete"] = complete
     folders = []
     for f in list(reg["markers"]):
+        if not os.path.isabs(f):
+            # Ambiguous (relative to whichever directory registered it): never act on it.
+            log(f"ignoring relative registry path {f!r}")
+            continue
+        norm = str(expand(f))
+        if norm != f:
+            reg["markers"].setdefault(norm, reg["markers"].pop(f))
+            f = norm
         p = Path(f)
+        if p in folders:
+            continue
         if (p / MARKER).is_file():
             if not roots or any(p == r or r in p.parents for r in roots):
                 folders.append(p)
@@ -1276,6 +1288,7 @@ def tree_problem(
 
 def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict:
     """Cheap checks first; deep=True adds the walk, lease, lsof and repo checks."""
+    folder = expand(folder)
     v = Verdict(marker=None, folder=folder)
     try:
         m = read_marker(folder)

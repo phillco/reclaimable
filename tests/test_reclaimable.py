@@ -1179,3 +1179,40 @@ def test_session_still_gone_at_removal_removes(env, monkeypatch):
     v = rc.evaluate(f, env.cfg, env.reg)
     ok, _ = rc.remove_folder(v, True, env.cfg, env.reg)
     assert ok and not f.exists()
+
+
+# --- relative paths are normalised to absolute lexical paths ---------------------
+
+
+def test_relative_mark_and_evaluate_apply_absolute_glob_deny(env, monkeypatch):
+    data = env.root / "data"
+    data.mkdir(exist_ok=True)
+    env.cfg.deny_paths.append(str(data / "*/models"))
+    monkeypatch.chdir(data)
+    make(env, "bucket", age_s=30 * DAY)
+    (data / "bucket/models").mkdir()
+    (data / "bucket/models/w.bin").write_bytes(b"w")
+    absolute = rc.evaluate(data / "bucket", env.cfg, env.reg)
+    relative = rc.evaluate(Path("bucket"), env.cfg, env.reg)
+    assert not absolute.safe and not relative.safe
+    assert "deny-listed" in relative.reason and relative.folder == data / "bucket"
+    # `mark` by relative path registers the absolute path
+    (data / "other").mkdir()
+    assert rc.main(["mark", "other", "-o", "t", "-r", "r"]) == 0
+    markers = json.loads(rc.REGISTRY.read_text())["markers"]
+    assert str(data / "other") in markers and "other" not in markers
+    assert rc.main(["mark", "../data/./other2", "-o", "t", "-r", "r"]) == 0
+    assert str(data / "other2") in json.loads(rc.REGISTRY.read_text())["markers"]
+
+
+def test_relative_registry_entries_are_ignored_not_deleted(env, monkeypatch):
+    data = env.root / "data"
+    f = make(env, "bucket", age_s=30 * DAY)
+    monkeypatch.chdir(data)
+    reg = {"markers": {"bucket": {"registered": 1}, str(f) + "/": {"registered": 2}}}
+    folders = rc.discover(env.cfg, reg)
+    assert folders == [f]
+    assert "bucket" in reg["markers"], "relative entry stays, untouched"
+    assert str(f) in reg["markers"] and str(f) + "/" not in reg["markers"]
+    assert "ignoring relative registry path" in rc.LOG_FILE.read_text()
+    assert f.exists()
