@@ -1216,3 +1216,76 @@ def test_relative_registry_entries_are_ignored_not_deleted(env, monkeypatch):
     assert str(f) in reg["markers"] and str(f) + "/" not in reg["markers"]
     assert "ignoring relative registry path" in rc.LOG_FILE.read_text()
     assert f.exists()
+
+
+# --- TTL clock is recomputed at removal; volume_floors paths are absolute --------
+
+
+def test_job_reclosed_recently_keeps_ttl_candidate(env):
+    set_job(env, "9", f"closed {iso_ago(30 * DAY)}")
+    f = make(env, "rc1", age_s=30 * DAY, job="9", kind="scratch")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.expired, v.reason
+    set_job(env, "9", f"closed {iso_ago(60)}")  # reopened and re-closed a minute ago
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "no longer expired" in detail
+
+
+def test_floor_pressure_candidate_ignores_recomputed_clock(env):
+    set_job(env, "9", f"closed {iso_ago(30 * DAY)}")
+    f = make(env, "rc2", age_s=30 * DAY, job="9", kind="scratch")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    set_job(env, "9", f"closed {iso_ago(60)}")
+    ok, _ = rc.remove_folder(v, True, env.cfg, env.reg, floor_pressure=True)
+    assert ok and not f.exists()
+
+
+def test_job_reclosed_during_move_keeps_source(env, monkeypatch):
+    set_job(env, "9", f"closed {iso_ago(30 * DAY)}")
+    f, dest = make_movable(env, "rc3", job="9")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.expired and v.action == "move", v.reason
+    real = rc.move_and_verify
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        set_job(env, "9", f"closed {iso_ago(30)}")
+        return out
+
+    monkeypatch.setattr(rc, "move_and_verify", slow)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "no longer expired" in detail
+
+
+def test_sweep_ttl_selected_candidate_still_removed(env):
+    set_job(env, "9", f"closed {iso_ago(30 * DAY)}")
+    f = make(env, "rc4", age_s=30 * DAY, job="9", kind="scratch")
+    rc.write_json(rc.ARMED_FILE, {"armed_at": time.time() - 2 * DAY})
+    rc.sweep(sweep_args(), env.cfg)
+    assert not f.exists()
+
+
+def test_relative_volume_floors_key_is_absolute(env, monkeypatch, tmp_path):
+    mount = env.root
+    while not os.path.ismount(mount) and mount != mount.parent:
+        mount = mount.parent
+    monkeypatch.chdir(mount)
+    cfg_file = tmp_path / "c.toml"
+    cfg_file.write_text('volume_floors = { "." = "10GB", "x/../y" = "1GB" }\n')
+    cfg = _fresh().load_config(cfg_file)
+    assert cfg.volume_floors == {str(mount): 10 * 10**9, str(mount / "y"): 10**9}
+
+
+def test_plan_matches_volume_floor_by_absolute_mount(env, monkeypatch):
+    f = make(env, "vf", age_s=3600, ttl="3d", files={"x": b"x" * 4096})
+    v = rc.evaluate(f, env.cfg, env.reg)
+    mount = f
+    while not os.path.ismount(mount) and mount != mount.parent:
+        mount = mount.parent
+    other = Path("/")  # pretend home lives on another device when possible
+    if other.stat().st_dev == f.stat().st_dev:
+        pytest.skip("home and data share a device here")
+    monkeypatch.setattr(rc, "HOME", other)
+    monkeypatch.chdir(mount)
+    env.cfg.volume_floors = {str(rc.expand(".")): 10**18}
+    assert [x.folder for x, _ in rc.plan([v], env.cfg)] == [f]

@@ -100,7 +100,10 @@ holders, open files, folder identity, a fresh `job_done` answer (the
 positive cache is bypassed; open, unknown or error keeps the folder),
 the session decision (pid exact; a non-pid session needs a fresh process-list
 no-match and an elapsed `session_grace`) and the worktree checks (dirty,
-unpushed, primary or nested repos) are re-checked. For a **move** the
+unpushed, primary or nested repos) are re-checked. The TTL clock is recomputed
+from the fresh marker mtime, job close time and session state, and a folder
+selected for its TTL that is no longer expired (a job reopened and reclosed)
+is kept; folders selected because free space is low are exempt. For a **move** the
 folder is copied (local, or `rsync` to `host:path`), every file is sha256-verified
 against the source, then the checks above run again and the source's content is
 re-hashed; a hold, new lease, reader or changed file during the copy keeps the
@@ -135,7 +138,8 @@ deny_exact = ["~/src"]                        # the folder itself may never be m
 # Non-numeric sessions can't be observed reliably (their id may never appear in a command
 # line). Unset (default): a session the process list doesn't show is "unknown" and keeps the
 # folder. With a grace, such a session counts as gone only if the job is closed AND now >=
-# the job's close time + grace; no close time (job_done printed none) keeps the folder.
+# the job's close time + grace. If job_done prints no close time, the first time the janitor
+# saw the job closed is used instead.
 # Numeric pids are always checked exactly; a process-list hit always blocks.
 session_grace = "72h"
 

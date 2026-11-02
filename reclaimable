@@ -1508,12 +1508,21 @@ def rmtree_same_dev(path: Path) -> list[Path]:
     return left
 
 
-def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool, str]:
+def entry_for(folder: Path, reg: dict) -> dict:
+    return reg["markers"].setdefault(str(folder), {"registered": now()})
+
+
+def remove_folder(
+    v: Verdict, armed: bool, cfg: Config, reg: dict, floor_pressure: bool = False
+) -> tuple[bool, str]:
     """Final re-checks, then move/delete. Returns (done, detail).
 
     Everything that could have changed since evaluation is re-checked under the
     marker lock (the same lock `hold` takes) immediately before the source is
-    renamed away, including after a long verified copy."""
+    renamed away, including after a long verified copy. Unless the folder was
+    chosen for free-space pressure (`floor_pressure`), its TTL/grace clock is
+    recomputed from the fresh marker mtime, job close time and session state and
+    it must still be expired."""
     m = v.marker
     assert m is not None
     if not armed:
@@ -1554,10 +1563,25 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
             if not closed:
                 return f"job {fresh.job} {detail if closed is False else 'state unknown: ' + detail}"
         if fresh.session:
-            entry = reg["markers"].setdefault(str(v.folder), {"registered": now()})
+            entry = entry_for(v.folder, reg)
             reason = session_problem(fresh, cfg, entry, closed_at)
             if reason:
                 return reason
+        if not floor_pressure:
+            start = fresh.mtime
+            if fresh.job:
+                start = max(start, closed_at or 0)
+            if fresh.session:
+                start = max(start, entry_for(v.folder, reg).get("session_exit_seen", 0))
+            try:
+                ttl_s = fresh.ttl_seconds
+            except ValueError as e:
+                return f"bad marker: {e}"
+            if now() - start < ttl_s:
+                return (
+                    f"no longer expired (clock restarted {human_age(now() - start)} ago, "
+                    f"ttl {human_age(ttl_s)})"
+                )
         # Repeat the worktree checks: work may have been added since evaluation
         # (or during a long copy) that the original verdict never saw.
         w = walk(v.folder, cfg, check_names=True)
@@ -1666,7 +1690,7 @@ def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
         while not os.path.ismount(mount) and mount != mount.parent:
             mount = mount.parent
         floor = cfg.volume_floors.get(
-            str(mount), cfg.floor if dev == home_dev else None
+            str(expand(mount)), cfg.floor if dev == home_dev else None
         )
         if floor is None:
             continue
@@ -1719,7 +1743,9 @@ def sweep(args, cfg: Config) -> int:
             acted.add(id(v))
             m = v.marker
             verb = "move" if v.action == "move" else "delete"
-            ok, detail = remove_folder(v, armed, cfg, reg)
+            ok, detail = remove_folder(
+                v, armed, cfg, reg, floor_pressure=why.startswith("low space")
+            )
             line = (
                 f"{'' if armed else '[dry-run] '}{verb if ok else ('would ' + verb if not armed else verb + ' SKIPPED')} "
                 f"{v.folder} ({human_bytes(v.size)}) owner={m.owner} kind={m.effective_kind} reason={why}"
