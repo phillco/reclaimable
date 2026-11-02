@@ -194,6 +194,11 @@ func runCommandInput(argv []string, timeout float64, cwd string, env []string, i
 	cmd.Stdout = &out
 	cmd.Stderr = &errout
 	err := cmd.Run()
+	// A leader can exit while descendants keep working (even with their pipes
+	// closed). Do not let those commands outlive the caller's safety lock.
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	code := 0
 	if err != nil {
 		code = -1
