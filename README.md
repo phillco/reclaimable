@@ -110,6 +110,12 @@ completed keeps the folder (fail closed):
    Nested primary git/jj repositories inside a marked folder keep it too.
 9. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
+10. **Replacement races**: discovery, safety walks, marker reads, hashing, copying
+    and recursive deletion open directories and files relative to checked
+    descriptors, without following symlinks. Opened device/inode identities must
+    match the inspected entries; replacements, unsupported file types and
+    incomplete checks keep the source. Recursive removal never follows a swapped
+    child symlink outside the marked tree.
 10. **Nested markers**: a marker at any depth protects its ancestor unless its
     own holds, TTL, deny-list, holders and checkout checks permit removal. Marker
     names are recognised case-folded; malformed, unreadable, symlink or non-file
@@ -130,10 +136,19 @@ protections, are re-checked. The TTL clock is recomputed
 from the fresh marker mtime, job close time and session state, and a folder
 selected for its TTL that is no longer expired (a job reopened and reclosed)
 is kept; folders selected because free space is low are exempt. For a **move** the
-folder is copied (local, or `rsync` to `host:path`), every file is sha256-verified
+folder is read into a private snapshot through checked descriptors, copied
+locally or streamed to `host:path`, and every file is sha256-verified
 against the source, then the checks above run again and the source's content is
 re-hashed; a hold, new lease, reader or changed file during the copy keeps the
-source. Removal renames the folder aside, then deletes it.
+source. Destinations must be new; creation refuses symlink ancestors and existing
+files. Moves refuse extended attributes and resource forks that the byte-copy
+protocol cannot preserve and verify (automatically attached system provenance is
+excluded). Remote moves require Python 3 on the destination host; the archive receiver
+and hash verifier use the same descriptor-relative protections. A failed copy may
+leave a partial destination for inspection, while retaining the source.
+Removal renames the folder aside through its checked parent descriptor, verifies
+its identity again, then deletes it through descriptors. These checks prevent
+symlink redirection; they do not freeze a tree against concurrent writers.
 
 **Dry-run until armed.** Sweeps act only once the host is armed (`reclaimable arm`)
 and 24 h have passed. `sweep -n` never acts; `sweep -A` acts immediately but still

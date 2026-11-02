@@ -21,19 +21,23 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
+import ctypes
 import fcntl
 import fnmatch
 import glob
 import hashlib
+import inspect
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tomllib
@@ -497,7 +501,12 @@ class Marker:
 
 def read_marker(folder: Path, *, marker_path: Path | None = None) -> Marker:
     path = marker_path if marker_path is not None else folder / MARKER
-    data = json.loads(path.read_text())
+    with _directory(path.parent) as parent_fd:
+        expected = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        with _regular_file(parent_fd, path.name, expected) as fd:
+            mtime = os.fstat(fd).st_mtime
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                data = json.load(stream)
     if not isinstance(data, dict):
         raise ValueError("marker is not a JSON object")
     if not isinstance(data.get("owner"), str) or not data["owner"].strip():
@@ -525,7 +534,7 @@ def read_marker(folder: Path, *, marker_path: Path | None = None) -> Marker:
         session=None if data.get("session") is None else str(data["session"]),
         move_to=data.get("move_to"),
         holds=holds,
-        mtime=path.stat().st_mtime,
+        mtime=mtime,
         extra={k: v for k, v in data.items() if k not in known},
     )
 
@@ -655,55 +664,54 @@ def state_lock():
 def scan(
     roots: list[Path], cfg: Config, limit_s: float = SCAN_LIMIT_S
 ) -> tuple[set[str], bool]:
-    """Find marker folders; prunes deny-listed trees and never descends into marked folders."""
+    """Bounded descriptor discovery, pruning denied and already marked trees."""
     found: set[str] = set()
     deadline = time.monotonic() + limit_s
     prune_paths = {path_key(p) for p in SCAN_PRUNE_PATHS}
     prune_names = {fold(p) for p in SCAN_PRUNE_NAMES}
     complete = True
+
+    def visit(fd: int, folder: Path, dev: int, depth: int):
+        nonlocal complete
+        if time.monotonic() > deadline:
+            raise OSError("discovery timed out")
+        entries = list(os.scandir(fd))
+        if any(
+            fold(e.name) == fold(MARKER)
+            and stat.S_ISREG(e.stat(follow_symlinks=False).st_mode)
+            for e in entries
+        ):
+            found.add(str(folder))
+            return
+        if depth >= SCAN_MAX_DEPTH:
+            complete = False
+            return
+        for entry in entries:
+            st = entry.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or st.st_dev != dev:
+                continue
+            child = folder / entry.name
+            if fold(entry.name) in prune_names or fold(entry.name).endswith(
+                (".app", ".photoslibrary")
+            ):
+                continue
+            if path_key(child) in prune_paths or any(
+                path_match(child, p) for p in cfg.deny_paths
+            ):
+                continue
+            try:
+                with _directory_at(fd, entry.name, st) as child_fd:
+                    visit(child_fd, child, dev, depth + 1)
+            except OSError:
+                complete = False
+
     for raw_root in roots:
         root = expand(raw_root)
-        stack = [(root, 0)]
-        root_dev = None
-        with contextlib.suppress(OSError):
-            root_dev = root.stat().st_dev
-        while stack:
-            if time.monotonic() > deadline:
-                return found, False
-            folder, depth = stack.pop()
-            try:
-                entries = list(os.scandir(folder))
-            except OSError:
-                continue
-            if any(
-                fold(e.name) == fold(MARKER) and e.is_file(follow_symlinks=False)
-                for e in entries
-            ):
-                found.add(str(folder))
-                continue
-            if depth >= SCAN_MAX_DEPTH:
-                complete = False
-                continue
-            for e in entries:
-                try:
-                    if not e.is_dir(follow_symlinks=False):
-                        continue
-                    if fold(e.name) in prune_names or fold(e.name).endswith(
-                        (".app", ".photoslibrary")
-                    ):
-                        continue
-                    if path_key(e.path) in prune_paths:
-                        continue
-                    if (
-                        root_dev is not None
-                        and e.stat(follow_symlinks=False).st_dev != root_dev
-                    ):
-                        continue
-                    if any(path_match(e.path, p) for p in cfg.deny_paths):
-                        continue
-                except OSError:
-                    continue
-                stack.append((Path(e.path), depth + 1))
+        try:
+            with _directory(root) as fd:
+                visit(fd, root, os.fstat(fd).st_dev, 0)
+        except OSError:
+            complete = False
     return found, complete
 
 
@@ -1247,14 +1255,16 @@ def ignored_files(folder: Path, repo: str) -> str | None:
         if res.returncode != 0:
             return "jj file list failed"
         tracked = set(res.stdout.splitlines())
-        for d, dirs, files in os.walk(folder):
-            rel_dir = os.path.relpath(d, folder)
-            if rel_dir == ".":
-                rel_dir = ""
-                dirs[:] = [x for x in dirs if x not in (".jj", ".git")]
-            for name in files:
-                rel = os.path.join(rel_dir, name)
-                if rel != MARKER and rel not in tracked:
+        with _directory(folder) as root_fd:
+            dev = os.fstat(root_fd).st_dev
+            for _, _, st, rel in _tree_entries(root_fd, dev, prune=(".git", ".jj")):
+                if st.st_dev != dev:
+                    return "ignored-file check crossed a filesystem"
+                if (
+                    not stat.S_ISDIR(st.st_mode)
+                    and str(rel) != MARKER
+                    and str(rel) not in tracked
+                ):
                     return f"contains ignored files; marker lacks ignored_ok ({rel})"
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -1274,7 +1284,7 @@ class Walk:
 def walk(
     folder: Path, cfg: Config, check_names: bool, limit_s: float = WALK_LIMIT_S
 ) -> Walk:
-    """Disk usage plus deny-listed descendants and nested repos; incomplete walks fail closed."""
+    """Disk usage and protection checks through no-follow directory descriptors."""
     folder = expand(folder)
     size = files = 0
     repos: list[Path] = []
@@ -1282,59 +1292,40 @@ def walk(
     markers: list[Path] = []
     seen: set[tuple[int, int]] = set()
     deadline = time.monotonic() + limit_s
-    dev = folder.lstat().st_dev
     patterns = [str(expand(p)) for p in cfg.deny_paths]
     try:
         protected = protected_identities(cfg)
     except Unreadable as e:
         return Walk(None, files, f"deny-list unreadable ({e})", repos)
-    stack = [folder]
-    while stack:
-        if time.monotonic() > deadline:
-            return Walk(None, files, "size walk timed out", repos)
-        d = stack.pop()
-        try:
-            entries = list(os.scandir(d))
-        except OSError as e:
-            return Walk(None, files, f"unreadable {d}: {e.strerror}", repos)
-        for e in entries:
-            try:
-                st = e.stat(follow_symlinks=False)
-            except OSError as e:
-                return Walk(
-                    None, files, f"unreadable {e.filename}: {e.strerror}", repos
-                )
-            files += 1
-            # A hardlinked file is one allocation however many names it has here.
-            if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
-                if (st.st_dev, st.st_ino) not in seen:
-                    seen.add((st.st_dev, st.st_ino))
-                    size += st.st_blocks * 512
-            else:
-                size += st.st_blocks * 512
-            rel = Path(e.path).relative_to(folder).parts
-            if fold(e.name) == fold(MARKER) and path_key(d) != path_key(folder):
-                if not stat.S_ISREG(st.st_mode):
-                    return Walk(
-                        None, files, f"invalid nested marker {'/'.join(rel)}", repos
-                    )
-                markers.append(Path(e.path))
-            hit_path = any(path_match(e.path, pattern) for pattern in patterns)
-            if hit_path or (st.st_dev, st.st_ino) in protected:
-                return Walk(None, files, f"contains deny-listed {'/'.join(rel)}", repos)
-            if check_names:
-                hit = _deny_name_hit(rel, cfg)
-                if hit:
-                    return Walk(
-                        None, files, f"contains deny-listed {'/'.join(rel)}", repos
-                    )
-            if fold(e.name) in (".git", ".jj") and path_key(d) != path_key(folder):
-                repos.append(Path(d))
-            if e.is_dir(follow_symlinks=False):
-                if st.st_dev == dev:
-                    stack.append(Path(e.path))
+    try:
+        with _directory(folder) as root_fd:
+            dev = os.fstat(root_fd).st_dev
+            for _, name, st, relative in _tree_entries(root_fd, dev, deadline=deadline):
+                files += 1
+                if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
+                    if (st.st_dev, st.st_ino) not in seen:
+                        seen.add((st.st_dev, st.st_ino))
+                        size += st.st_blocks * 512
                 else:
-                    crossed.append(Path(e.path))
+                    size += st.st_blocks * 512
+                path = folder / relative
+                if fold(name) == fold(MARKER) and relative.parent != Path():
+                    if not stat.S_ISREG(st.st_mode):
+                        return Walk(
+                            None, files, f"invalid nested marker {relative}", repos
+                        )
+                    markers.append(path)
+                hit_path = any(path_match(path, pattern) for pattern in patterns)
+                if hit_path or (st.st_dev, st.st_ino) in protected:
+                    return Walk(None, files, f"contains deny-listed {relative}", repos)
+                if check_names and _deny_name_hit(relative.parts, cfg):
+                    return Walk(None, files, f"contains deny-listed {relative}", repos)
+                if fold(name) in (".git", ".jj") and relative.parent != Path():
+                    repos.append(path.parent)
+                if stat.S_ISDIR(st.st_mode) and st.st_dev != dev:
+                    crossed.append(path)
+    except OSError as e:
+        return Walk(None, files, f"unreadable size walk: {e}", repos)
     return Walk(size, files, None, sorted(set(repos)), crossed, markers)
 
 
@@ -1342,6 +1333,7 @@ def walk(
 class Verdict:
     marker: Marker | None
     folder: Path
+    directory_identity: tuple[int, int] | None = None
     last_used: float = 0.0
     clock_start: float = 0.0
     ttl_s: float = 0.0
@@ -1434,6 +1426,9 @@ def tree_problem(
             return f"{label}: ambiguous marker spelling", None
         try:
             nested = read_marker(marker_path.parent, marker_path=marker_path)
+            denied = deny_reason(nested.folder, cfg)
+            if denied:
+                return f"{label}: refused: {denied}", None
             if nested.holds:
                 return f"{label}: held", None
             if nested.job or nested.session:
@@ -1507,7 +1502,7 @@ def tree_problem(
 def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict:
     """Cheap checks first; deep=True adds the walk, lease, lsof and repo checks."""
     folder = expand(folder)
-    v = Verdict(marker=None, folder=folder)
+    v = Verdict(marker=None, folder=folder, directory_identity=identity(folder))
     try:
         m = read_marker(folder)
     except (OSError, ValueError) as e:
@@ -1546,6 +1541,9 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
     v.clock_start = start
     v.expired = now() - start >= v.ttl_s
     if not deep:
+        if v.directory_identity is None or identity(folder) != v.directory_identity:
+            v.reason = "folder replaced during evaluation"
+            return v
         v.safe = True
         v.reason = (
             "expired (shallow)"
@@ -1570,6 +1568,9 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
     if busy:
         v.reason = busy
         return v
+    if v.directory_identity is None or identity(folder) != v.directory_identity:
+        v.reason = "folder replaced during evaluation"
+        return v
     v.safe = True
     v.reason = (
         f"expired ({human_age(now() - start)} > {m.ttl or DEFAULT_TTL[m.effective_kind]})"
@@ -1584,45 +1585,467 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
 # --- removal -----------------------------------------------------------------------------
 
 
-def file_hashes(root: Path) -> dict[str, str]:
+def _same_node(a, b) -> bool:
+    return (a.st_dev, a.st_ino, stat.S_IFMT(a.st_mode)) == (
+        b.st_dev,
+        b.st_ino,
+        stat.S_IFMT(b.st_mode),
+    )
+
+
+def _require_node(parent_fd: int, name: str, expected) -> None:
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _same_node(current, expected):
+        raise OSError(f"replaced filesystem entry: {name}")
+
+
+@contextlib.contextmanager
+def _directory_at(parent_fd: int, name: str, expected=None):
+    if expected is None:
+        expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(expected.st_mode):
+        raise OSError(f"symlink in path: {name}")
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        if not _same_node(os.fstat(fd), expected):
+            raise OSError(f"replaced directory: {name}")
+        _require_node(parent_fd, name, expected)
+        yield fd
+        _require_node(parent_fd, name, expected)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _directory(path: Path, create: bool = False):
+    """Open all path components without following links, optionally creating them."""
+    path = Path(os.path.abspath(Path(path).expanduser()))
+    with contextlib.ExitStack() as stack:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        stack.callback(os.close, fd)
+        for name in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            fd = stack.enter_context(_directory_at(fd, name))
+        yield fd
+
+
+def _tree_entries(
+    fd: int, dev: int, rel: Path = Path(), depth: int = 0, deadline=None, prune=()
+):
+    """Yield checked descriptor-relative entries; never follow directory symlinks."""
+    if deadline is None:
+        deadline = time.monotonic() + WALK_LIMIT_S
+    if depth > 200 or time.monotonic() > deadline:
+        raise OSError("tree traversal depth/time limit exceeded")
+    for entry in list(os.scandir(fd)):
+        if time.monotonic() > deadline:
+            raise OSError("tree traversal timed out")
+        st = entry.stat(follow_symlinks=False)
+        name = entry.name
+        _require_node(fd, name, st)
+        yield fd, name, st, rel / name
+        _require_node(fd, name, st)
+        if depth == 0 and fold(name) in prune:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_dev == dev:
+            with _directory_at(fd, name, st) as child_fd:
+                yield from _tree_entries(
+                    child_fd, dev, rel / name, depth + 1, deadline, prune
+                )
+
+
+@contextlib.contextmanager
+def _regular_file(parent_fd: int, name: str, expected):
+    if not stat.S_ISREG(expected.st_mode):
+        raise OSError(f"not a regular file: {name}")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        if not _same_node(before, expected):
+            raise OSError(f"replaced file: {name}")
+        yield fd
+        after = os.fstat(fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError(f"file changed while reading: {name}")
+        _require_node(parent_fd, name, expected)
+    finally:
+        os.close(fd)
+
+
+def _refuse_extended_data(fd: int) -> None:
+    """A byte-only verified move cannot authorise losing extended payloads."""
+    if hasattr(os, "listxattr"):
+        names = os.listxattr(fd)
+    elif sys.platform == "darwin":
+        query = ctypes.CDLL(None, use_errno=True).flistxattr
+        query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        query.restype = ctypes.c_ssize_t
+        size = query(fd, None, 0, 0)
+        if size < 0 or size > 1 << 20:
+            raise OSError("cannot inspect extended attributes")
+        buffer = ctypes.create_string_buffer(size)
+        count = query(fd, buffer, size, 0)
+        if count < 0 or count > size:
+            raise OSError("cannot inspect extended attributes")
+        names = [
+            n.decode("utf-8", "replace") for n in buffer.raw[:count].split(b"\0") if n
+        ]
+    else:
+        raise OSError("extended attribute inspection unavailable")
+    # System-managed provenance is attached automatically, including to new
+    # temporary files. All application attributes and resource forks veto moves.
+    if any(name != "com.apple.provenance" for name in names):
+        raise OSError("extended data cannot be preserved and verified; source kept")
+
+
+@contextlib.contextmanager
+def _relative_directory(root_fd: int, relative: Path, expected: dict):
+    with contextlib.ExitStack() as stack:
+        fd = root_fd
+        current = Path()
+        for name in relative.parts:
+            current /= name
+            fd = stack.enter_context(_directory_at(fd, name, expected[current]))
+        yield fd
+
+
+def _content_tree(root: Path, destination: Path | None = None) -> dict[str, str]:
+    """Hash, optionally snapshot, through descriptors; destination must be new."""
     out = {}
-    for d, dirs, files in os.walk(root):
-        for name in files + [x for x in dirs if (Path(d) / x).is_symlink()]:
+    destination_ids = {}
+    directory_metadata = {}
+    with contextlib.ExitStack() as stack:
+        root_fd = stack.enter_context(_directory(root))
+        _refuse_extended_data(root_fd)
+        dev = os.fstat(root_fd).st_dev
+        dest_root = None
+        if destination is not None:
+            parent_fd = stack.enter_context(_directory(destination.parent, create=True))
+            os.mkdir(destination.name, mode=0o700, dir_fd=parent_fd)
+            dest_root = stack.enter_context(_directory_at(parent_fd, destination.name))
+        for parent_fd, name, st, rel in _tree_entries(root_fd, dev):
+            if st.st_dev != dev:
+                raise OSError(f"another filesystem at {rel}")
+            if stat.S_ISDIR(st.st_mode):
+                with _directory_at(parent_fd, name, st) as fd:
+                    _refuse_extended_data(fd)
+                if dest_root is not None:
+                    with _relative_directory(
+                        dest_root, rel.parent, destination_ids
+                    ) as dest_fd:
+                        os.mkdir(name, mode=0o700, dir_fd=dest_fd)
+                        destination_ids[rel] = os.stat(
+                            name, dir_fd=dest_fd, follow_symlinks=False
+                        )
+                        directory_metadata[rel] = st
+                continue
             if name == ".DS_Store":
                 continue
-            p = Path(d) / name
-            rel = str(p.relative_to(root))
-            if p.is_symlink():
-                out[rel] = "link:" + os.readlink(p)
+            if stat.S_ISLNK(st.st_mode):
+                if sys.platform == "darwin":
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_SYMLINK | os.O_NONBLOCK,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        if not _same_node(os.fstat(fd), st):
+                            raise OSError("symlink replaced")
+                        _refuse_extended_data(fd)
+                    finally:
+                        os.close(fd)
+                elif hasattr(os, "listxattr"):
+                    names = os.listxattr(
+                        f"/proc/self/fd/{parent_fd}/{name}", follow_symlinks=False
+                    )
+                    if names:
+                        raise OSError("extended data on symlink; source kept")
+                else:
+                    raise OSError("symlink attribute inspection unavailable")
+                link = os.readlink(name, dir_fd=parent_fd)
+                _require_node(parent_fd, name, st)
+                out[str(rel)] = "link:" + link
+                if dest_root is not None:
+                    with _relative_directory(
+                        dest_root, rel.parent, destination_ids
+                    ) as dest_fd:
+                        os.symlink(link, name, dir_fd=dest_fd)
                 continue
             h = hashlib.sha256()
-            with p.open("rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-            out[rel] = h.hexdigest()
+            with _regular_file(parent_fd, name, st) as source_fd:
+                _refuse_extended_data(source_fd)
+                with contextlib.ExitStack() as file_stack:
+                    target = None
+                    if dest_root is not None:
+                        dest_fd = file_stack.enter_context(
+                            _relative_directory(dest_root, rel.parent, destination_ids)
+                        )
+                        target_fd = os.open(
+                            name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=dest_fd,
+                        )
+                        target = file_stack.enter_context(os.fdopen(target_fd, "wb"))
+                        target_stat = os.fstat(target_fd)
+                    for chunk in iter(lambda: os.read(source_fd, 1 << 20), b""):
+                        h.update(chunk)
+                        if target is not None:
+                            target.write(chunk)
+                    if target is not None:
+                        target.flush()
+                        os.fchmod(target_fd, stat.S_IMODE(st.st_mode) & 0o777)
+                        os.utime(target_fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+                        _require_node(dest_fd, name, target_stat)
+            out[str(rel)] = h.hexdigest()
+        # Set directory metadata after populating descendants, deepest first.
+        for relative, st in reversed(list(directory_metadata.items())):
+            with _relative_directory(dest_root, relative, destination_ids) as fd:
+                os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o777)
+                os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
     return out
+
+
+def file_hashes(root: Path) -> dict[str, str]:
+    return _content_tree(root)
 
 
 def remote_run(
     cfg_cmd: list[str], host: str, script: str, **kw
 ) -> subprocess.CompletedProcess:
     cmd = [a.replace("{host}", host).replace("{script}", script) for a in cfg_cmd]
-    return subprocess.run(cmd, stdin=subprocess.DEVNULL, **kw)
+    kw.setdefault("stdin", subprocess.DEVNULL)
+    return subprocess.run(cmd, **kw)
+
+
+def _remote_archive(mode, destination):
+    """Self-contained remote receiver/hash program; never follows path symlinks."""
+    import contextlib
+    import hashlib
+    import json
+    import os
+    import stat
+    import sys
+    import tarfile
+    from pathlib import Path
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def same(a, b):
+        return (a.st_dev, a.st_ino, stat.S_IFMT(a.st_mode)) == (
+            b.st_dev,
+            b.st_ino,
+            stat.S_IFMT(b.st_mode),
+        )
+
+    def require(parent, name, expected):
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not same(current, expected):
+            raise OSError(f"entry replaced: {name}")
+
+    @contextlib.contextmanager
+    def directory_at(parent, name, expected=None, create=False):
+        if create:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode) or (
+            expected is not None and not same(before, expected)
+        ):
+            raise OSError(f"not the expected directory: {name}")
+        fd = os.open(name, flags, dir_fd=parent)
+        try:
+            if not same(os.fstat(fd), before):
+                raise OSError(f"directory replaced: {name}")
+            require(parent, name, before)
+            yield fd
+            require(parent, name, before)
+        finally:
+            os.close(fd)
+
+    @contextlib.contextmanager
+    def directory(path, create=False, exclusive=False):
+        path = Path(os.path.abspath(Path(path).expanduser()))
+        with contextlib.ExitStack() as stack:
+            fd = os.open("/", flags)
+            stack.callback(os.close, fd)
+            for index, name in enumerate(path.parts[1:]):
+                last = index == len(path.parts) - 2
+                if exclusive and last:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                fd = stack.enter_context(directory_at(fd, name, create=create))
+            if exclusive and path == Path("/"):
+                raise OSError("destination already exists")
+            yield fd
+
+    def inventory(fd, prefix, dev, out):
+        for entry in list(os.scandir(fd)):
+            if entry.name == ".DS_Store":
+                continue
+            expected = entry.stat(follow_symlinks=False)
+            relative = prefix + entry.name
+            if stat.S_ISDIR(expected.st_mode):
+                if expected.st_dev != dev:
+                    raise OSError(f"filesystem boundary: {relative}")
+                with directory_at(fd, entry.name, expected) as child:
+                    inventory(child, relative + "/", dev, out)
+            elif stat.S_ISLNK(expected.st_mode):
+                out[relative] = "link:" + os.readlink(entry.name, dir_fd=fd)
+                require(fd, entry.name, expected)
+            elif stat.S_ISREG(expected.st_mode):
+                opened = os.open(
+                    entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
+                )
+                with os.fdopen(opened, "rb") as source:
+                    before = os.fstat(source.fileno())
+                    if not same(before, expected):
+                        raise OSError(f"file replaced: {relative}")
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: source.read(1 << 20), b""):
+                        digest.update(chunk)
+                    after = os.fstat(source.fileno())
+                    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
+                        raise OSError(f"file changed: {relative}")
+                require(fd, entry.name, expected)
+                out[relative] = digest.hexdigest()
+            else:
+                raise OSError(f"unsupported file type: {relative}")
+
+    if mode == "hash":
+        hashes = {}
+        with directory(destination) as fd:
+            inventory(fd, "", os.fstat(fd).st_dev, hashes)
+        print(json.dumps(hashes), flush=True)
+        return
+    if mode != "receive":
+        raise ValueError("invalid transfer operation")
+    destination_ids = {}
+
+    @contextlib.contextmanager
+    def extraction_directory(parent, name, relative):
+        expected = destination_ids.get(relative)
+        with directory_at(
+            parent, name, expected=expected, create=expected is None
+        ) as fd:
+            if expected is None:
+                destination_ids[relative] = os.fstat(fd)
+            yield fd
+
+    with directory(destination, create=True, exclusive=True) as root:
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+            for member in archive:
+                parts = member.name.rstrip("/").split("/")
+                if not parts or any(p in ("", ".", "..") for p in parts):
+                    raise ValueError("unsafe archive member")
+                if not (member.isdir() or member.isfile() or member.issym()):
+                    raise ValueError("unsupported archive member")
+                with contextlib.ExitStack() as stack:
+                    parent = root
+                    for index, name in enumerate(parts[:-1]):
+                        parent = stack.enter_context(
+                            extraction_directory(
+                                parent, name, tuple(parts[: index + 1])
+                            )
+                        )
+                    name = parts[-1]
+                    if member.isdir():
+                        with extraction_directory(parent, name, tuple(parts)):
+                            pass
+                    elif member.issym():
+                        os.symlink(member.linkname, name, dir_fd=parent)
+                    else:
+                        fd = os.open(
+                            name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=parent,
+                        )
+                        with os.fdopen(fd, "wb") as target:
+                            original = os.fstat(target.fileno())
+                            source = archive.extractfile(member)
+                            if source is None:
+                                raise ValueError("missing archive file data")
+                            remaining = member.size
+                            with source:
+                                while remaining:
+                                    chunk = source.read(min(1 << 20, remaining))
+                                    if not chunk:
+                                        raise ValueError("truncated archive file")
+                                    target.write(chunk)
+                                    remaining -= len(chunk)
+                            target.flush()
+                            os.fchmod(target.fileno(), member.mode & 0o777)
+                            os.utime(target.fileno(), (member.mtime, member.mtime))
+                        require(parent, name, original)
+
+
+def _remote_script(mode: str, path: str) -> str:
+    source = inspect.getsource(_remote_archive)
+    source += f"\n_remote_archive({mode!r}, {path!r})\n"
+    return "python3 -c " + shlex_quote(source)
+
+
+def remote_copy(
+    stage: Path, dest: str, host: str, cfg_cmd: list[str]
+) -> tuple[bool, str]:
+    """Transfer a private snapshot to an exclusively created remote directory."""
+    try:
+        with tempfile.TemporaryFile() as stream:
+            # The source is a private snapshot, never the mutable marked tree.
+            with tarfile.open(fileobj=stream, mode="w") as archive:
+                for child in sorted(stage.iterdir()):
+                    archive.add(child, arcname=child.name, recursive=True)
+            stream.seek(0)
+            result = remote_run(
+                cfg_cmd,
+                host,
+                _remote_script("receive", dest),
+                stdin=stream,
+                capture_output=True,
+                text=True,
+                timeout=WALK_LIMIT_S,
+            )
+        if result.returncode != 0:
+            return False, f"remote transfer failed: {result.stderr.strip()[:160]}"
+        return True, dest
+    except (OSError, ValueError, tarfile.TarError, subprocess.TimeoutExpired) as e:
+        return False, f"remote transfer failed: {e}"
 
 
 def remote_hashes(host: str, path: str, cfg_cmd: list[str]) -> dict[str, str] | None:
-    script = (
-        f"cd {shlex_quote(path)} && find . -type f ! -name .DS_Store -print0 | xargs -0 shasum -a 256; "
-        f'find . -type l -print0 | while IFS= read -r -d \'\' l; do printf \'link:%s  %s\\n\' "$(readlink "$l")" "$l"; done'
-    )
-    res = remote_run(cfg_cmd, host, script, capture_output=True, text=True)
-    if res.returncode != 0:
+    try:
+        res = remote_run(
+            cfg_cmd,
+            host,
+            _remote_script("hash", path),
+            capture_output=True,
+            text=True,
+            timeout=WALK_LIMIT_S,
+        )
+        if res.returncode != 0:
+            return None
+        out = json.loads(res.stdout)
+        if not isinstance(out, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in out.items()
+        ):
+            return None
+        return out
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
-    out = {}
-    for line in res.stdout.splitlines():
-        digest, _, rel = line.partition("  ")
-        out[rel[2:] if rel.startswith("./") else rel] = digest
-    return out
 
 
 def shlex_quote(s: str) -> str:
@@ -1647,82 +2070,96 @@ def move_and_verify(
 ) -> tuple[bool, str]:
     remote_cmd = remote_cmd or DEFAULT_REMOTE_COMMAND
     host, dest = move_destination(dest_root, folder)
-    if src is None:
-        src = file_hashes(folder)
-    src = {k: v for k, v in src.items() if k != MARKER}
-    if host:
-        mk = remote_run(
-            remote_cmd, host, f"mkdir -p {shlex_quote(dest)}", capture_output=True
-        )
-        if mk.returncode != 0:
-            return False, f"mkdir on {host} failed"
-        r = subprocess.run(
-            ["rsync", "-a", "--exclude", ".DS_Store", f"{folder}/", f"{host}:{dest}/"],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-        )
-        if r.returncode != 0:
-            return False, f"rsync failed: {r.stderr.strip()[:120]}"
-        got = remote_hashes(host, dest, remote_cmd)
-        if got is None:
-            return False, "remote hash failed"
-    else:
-        d = Path(dest)
-        if d.exists():
-            return False, f"destination exists: {d}"
-        d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            folder, d, symlinks=True, ignore=shutil.ignore_patterns(".DS_Store")
-        )
-        got = file_hashes(d)
-    got.pop(MARKER, None)
-    if got != src:
-        missing = sorted(set(src) - set(got))[:3]
-        changed = sorted(k for k in set(src) & set(got) if src[k] != got[k])[:3]
-        return (
-            False,
-            f"hash mismatch at {host + ':' if host else ''}{dest} (missing {missing}, changed {changed})",
-        )
+    try:
+        if src is None:
+            src = file_hashes(folder)
+        src = {k: v for k, v in src.items() if k != MARKER}
+        # Transport only a private, descriptor-read snapshot. A mutable source
+        # must never be handed to a path-following recursive copy program.
+        with tempfile.TemporaryDirectory(prefix="reclaimable-") as temporary:
+            stage = Path(temporary).resolve() / "snapshot"
+            snapshot = _content_tree(folder, stage)
+            snapshot.pop(MARKER, None)
+            staged = file_hashes(stage)
+            staged.pop(MARKER, None)
+            if snapshot != src or staged != src:
+                return False, "hash mismatch in snapshot; source changed or copy failed"
+            if host:
+                ok, detail = remote_copy(stage, dest, host, remote_cmd)
+                if not ok:
+                    return False, detail
+                got = remote_hashes(host, dest, remote_cmd)
+                if got is None:
+                    return False, "remote hash failed"
+            else:
+                _content_tree(stage, Path(dest))
+                got = file_hashes(Path(dest))
+        got.pop(MARKER, None)
+        if got != src:
+            missing = sorted(set(src) - set(got))[:3]
+            changed = sorted(k for k in set(src) & set(got) if src[k] != got[k])[:3]
+            return (
+                False,
+                f"hash mismatch at {dest} (missing {missing}, changed {changed})",
+            )
+        current = file_hashes(folder)
+        current.pop(MARKER, None)
+        if current != src:
+            return False, "source changed while it was being copied"
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return False, f"copy/verification failed: {e}"
     return True, f"{host + ':' if host else ''}{dest}"
 
 
-def rmtree_same_dev(path: Path) -> list[Path]:
+def rmtree_same_dev(path: Path, expected=None) -> list[Path]:
     """Delete `path` without crossing into other filesystems. Returns the directories
     left behind because they are mount points (or could not be removed)."""
-    st = path.lstat()
-    if not stat.S_ISDIR(st.st_mode):
-        raise OSError(f"refusing to remove {path}: not a real directory")
-    dev = st.st_dev
     left: list[Path] = []
 
-    def clear(d: Path) -> bool:
+    def clear(fd: int, d: Path, dev: int, depth: int = 0) -> bool:
         ok = True
+        if depth > 200:
+            left.append(d)
+            return False
         try:
-            entries = list(os.scandir(d))
+            entries = list(os.scandir(fd))
         except OSError:
             left.append(d)
             return False
         for e in entries:
+            child = d / e.name
             try:
                 st = e.stat(follow_symlinks=False)
-                if e.is_dir(follow_symlinks=False):
+                _require_node(fd, e.name, st)
+                if stat.S_ISDIR(st.st_mode):
                     if st.st_dev != dev:
-                        left.append(Path(e.path))
+                        left.append(child)
                         ok = False
-                    elif clear(Path(e.path)):
-                        os.rmdir(e.path)
                     else:
-                        ok = False
+                        with _directory_at(fd, e.name, st) as child_fd:
+                            complete = clear(child_fd, child, dev, depth + 1)
+                        if complete:
+                            _require_node(fd, e.name, st)
+                            os.rmdir(e.name, dir_fd=fd)
+                        else:
+                            ok = False
                 else:
-                    os.unlink(e.path)
+                    _require_node(fd, e.name, st)
+                    os.unlink(e.name, dir_fd=fd)
             except OSError:
-                left.append(Path(e.path))
+                left.append(child)
                 ok = False
         return ok
 
-    if clear(path):
-        os.rmdir(path)
+    with _directory(path.parent) as parent_fd:
+        st = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if expected is not None and not _same_node(st, expected):
+            raise OSError("removal root replaced")
+        with _directory_at(parent_fd, path.name, st) as root_fd:
+            complete = clear(root_fd, path, st.st_dev)
+        if complete:
+            _require_node(parent_fd, path.name, st)
+            os.rmdir(path.name, dir_fd=parent_fd)
     return left
 
 
@@ -1742,7 +2179,8 @@ def remove_folder(
     recomputed from the fresh marker mtime, job close time and session state and
     it must still be expired."""
     m = v.marker
-    assert m is not None
+    if m is None:
+        return False, "invalid or missing marker"
     if not armed:
         return False, "dry-run"
     if os.path.ismount(v.folder):
@@ -1751,6 +2189,11 @@ def remove_folder(
         ident = v.folder.lstat()
     except OSError as e:
         return False, f"folder unreadable: {e.strerror}"
+    if (
+        v.directory_identity is None
+        or (ident.st_dev, ident.st_ino) != v.directory_identity
+    ):
+        return False, "folder replaced since evaluation"
 
     def recheck(src_hashes: dict[str, str] | None = None) -> str | None:
         try:
@@ -1809,7 +2252,10 @@ def remove_folder(
         if repo != v.repo:
             return "repository type changed since evaluation"
         if src_hashes is not None:
-            current = file_hashes(v.folder)
+            try:
+                current = file_hashes(v.folder)
+            except OSError as e:
+                return f"source unreadable during verification: {e}"
             current.pop(MARKER, None)
             if current != src_hashes:
                 return "source changed while it was being copied"
@@ -1822,7 +2268,10 @@ def remove_folder(
     dest_detail = ""
     src_hashes = None
     if v.action == "move":
-        src_hashes = file_hashes(v.folder)
+        try:
+            src_hashes = file_hashes(v.folder)
+        except OSError as e:
+            return False, f"source unreadable: {e}"
         src_hashes.pop(MARKER, None)
         ok, detail = move_and_verify(
             v.folder, v.dest, cfg.remote_command, src=src_hashes
@@ -1857,13 +2306,42 @@ def remove_folder(
             )
             if res.returncode != 0:
                 return False, f"jj workspace forget failed: {res.stderr.strip()[:100]}"
-        trash = v.folder.with_name(f".{v.folder.name}.reclaimable-trash-{int(now())}")
-        os.rename(v.folder, trash)
-        if trash.is_symlink() or not trash.is_dir():
-            # Swapped for a symlink after the check: put it back untouched.
-            os.rename(trash, v.folder)
-            return False, "folder became a symlink; restored, nothing deleted"
-    left = rmtree_same_dev(trash)
+        trash = v.folder.with_name(
+            f".{v.folder.name}.reclaimable-trash-{secrets.token_hex(12)}"
+        )
+        try:
+            with _directory(v.folder.parent) as parent_fd:
+                _require_node(parent_fd, v.folder.name, ident)
+                try:
+                    os.stat(trash.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False, "quarantine destination exists"
+                os.rename(
+                    v.folder.name,
+                    trash.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                moved = os.stat(trash.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not _same_node(moved, ident):
+                    try:
+                        os.stat(v.folder.name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        os.rename(
+                            trash.name,
+                            v.folder.name,
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                        )
+                    return False, "folder replaced before rename; nothing deleted"
+        except OSError as e:
+            return False, f"rename refused: {e}"
+    try:
+        left = rmtree_same_dev(trash, expected=ident)
+    except OSError as e:
+        return False, f"kept renamed source at {trash}: {e}"
     if common:
         run(["git", "--git-dir", str(common), "worktree", "prune"], timeout=60)
     reg["markers"].pop(str(v.folder), None)

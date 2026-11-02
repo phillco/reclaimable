@@ -750,14 +750,14 @@ def test_folder_swapped_for_symlink_before_rename_is_restored(env, monkeypatch):
     real_rename = os.rename
     state = {"n": 0}
 
-    def rename(a, b):
-        if state["n"] == 0 and Path(a) == f:
+    def rename(a, b, **kwargs):
+        if state["n"] == 0 and (Path(a) == f or a == f.name):
             # Simulate a race: the folder was replaced by a symlink just before the rename.
             state["n"] += 1
             moved = f.with_name("swapped-away")
             real_rename(f, moved)
             f.symlink_to(victim, target_is_directory=True)
-        return real_rename(a, b)
+        return real_rename(a, b, **kwargs)
 
     monkeypatch.setattr(rc.os, "rename", rename)
     ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
