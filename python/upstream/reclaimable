@@ -1,0 +1,2263 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Janitor for regenerable folders marked with `.reclaimable`.
+
+A `.reclaimable` JSON marker in a folder says the folder can be regenerated:
+owner, ttl, regenerate, optional kind/job/session/move_to, and holds. The
+marker's mtime is the folder's last use; owners `touch` it. One janitor per
+host (`sweep`, run hourly from a scheduler) removes or moves expired folders,
+and frees space least-recently-used first below the host's floor, but only
+folders that pass every safety check (deny-list, holds, open files, configured
+holders, job close + session exit, clean and pushed worktrees). Dry-run until
+the host is armed (`reclaimable arm`; the first 24 h after arming stay dry-run).
+
+Config: ~/.config/reclaimable/config.toml (override with $RECLAIMABLE_CONFIG).
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import contextlib
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+HOME = Path.home()
+MARKER = ".reclaimable"
+STATE_DIR = HOME / ".local/state/reclaimable"
+CONFIG_DIR = HOME / ".config/reclaimable"
+CONFIG_FILE = Path(
+    os.environ.get("RECLAIMABLE_CONFIG") or CONFIG_DIR / "config.toml"
+).expanduser()
+ARMED_FILE = CONFIG_DIR / "armed"
+LOG_FILE = HOME / ".local/log/reclaimable.log"
+REGISTRY = STATE_DIR / "registry.json"
+LAST_SWEEP = STATE_DIR / "last-sweep.json"
+ARM_GRACE_S = 24 * 3600
+SCAN_EVERY_S = 24 * 3600
+SCAN_LIMIT_S = 120
+SCAN_MAX_DEPTH = 8
+WALK_LIMIT_S = 300
+LSOF_TIMEOUT_S = 90
+HOLDER_TIMEOUT_S = 60
+JOB_TIMEOUT_S = 30
+GB = 10**9
+GIB = 2**30
+DEFAULT_FLOOR = 30 * GB
+TARGET_MARGIN = 20 * GB
+KINDS = ("cache", "scratch", "worktree", "mirror", "staged")
+DEFAULT_REMOTE_COMMAND = ["ssh", "{host}", "{script}"]
+# Defaults when a marker omits ttl.
+DEFAULT_TTL = {
+    "cache": "24h",
+    "mirror": "3d",
+    "scratch": "7d",  # counted from job close for job-tied scratch
+    "staged": "2d",  # counted from job close
+    "worktree": "7d",
+}
+
+# --- built-in deny-list ----------------------------------------------------------
+# Never removed, even if marked; `mark` refuses them. The config file may only add.
+DENY_PATHS = ["~/.ssh", "~/.gnupg", "~/Library/Keychains"]
+# Component names refused on the path, its ancestors, and anywhere inside it
+# (every kind, mirrors included).
+DENY_NAMES = ["*.photoslibrary"]
+DENY_SEQUENCES: list[tuple[str, ...]] = []
+# The path itself and its ancestors may never be one of these.
+DENY_SELF_NAMES = [".git", ".jj"]
+# The folder itself may never be one of these (exact match).
+BROAD = [
+    "/",
+    "/Users",
+    "/Volumes",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/private",
+    "/tmp",
+    "/private/tmp",
+    "/opt",
+    "/usr",
+    "~",
+    "~/Documents",
+    "~/Desktop",
+    "~/Downloads",
+    "~/Pictures",
+    "~/Music",
+    "~/Movies",
+    "~/Library",
+    "~/.local",
+    "~/.local/share",
+    "~/.local/state",
+    "~/.config",
+    "~/.ssh",
+    "~/Applications",
+    "~/.cache",
+]
+# Discovery never descends into these (names anywhere, or exact paths).
+SCAN_PRUNE_NAMES = {
+    ".git",
+    ".jj",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".Trash",
+    "DerivedData",
+    ".build",
+    "target",
+}
+SCAN_PRUNE_PATHS = ["~/Library", "~/.Trash", "~/Pictures", "~/Music", "~/Movies"]
+
+
+def now() -> float:
+    return time.time()
+
+
+def say(*args) -> None:
+    print(*args, flush=True)
+
+
+DATA_VOLUME = "/System/Volumes/Data"
+
+
+def strip_data(p: str | Path) -> Path:
+    """macOS firmlinks make /System/Volumes/Data/Users/x the same directory as
+    /Users/x with no symlink involved: use the canonical spelling everywhere."""
+    text = str(p)
+    if text == DATA_VOLUME:
+        return Path("/")
+    if text.startswith(DATA_VOLUME + "/"):
+        return Path(text[len(DATA_VOLUME) :])
+    return Path(text)
+
+
+def expand(p: str | Path) -> Path:
+    """Absolute, lexically normalised path (`~` expanded, relative paths taken from
+    the current directory, `..` collapsed, the Data-volume firmlink prefix removed;
+    symlinks are NOT resolved)."""
+    return strip_data(os.path.abspath(Path(p).expanduser()))
+
+
+def fold(text: str) -> str:
+    """Conservative comparison form: Unicode-normalised and case-folded, so case
+    variants and NFC/NFD spellings of a protected name compare equal. Over-protecting
+    on case-sensitive volumes is intended."""
+    out = unicodedata.normalize("NFKC", text).casefold()
+    return unicodedata.normalize("NFKC", out)
+
+
+def pmatch(text: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(fold(text), fold(pattern))
+
+
+def identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def protected_identities(cfg: "Config") -> set[tuple[int, int]]:
+    """Filesystem identities of the existing, non-glob deny paths."""
+    out = set()
+    for raw in cfg.deny_paths:
+        if not glob.has_magic(str(expand(raw))):
+            ident = identity(expand(raw))
+            if ident:
+                out.add(ident)
+    return out
+
+
+def hostname() -> str:
+    return socket.gethostname().split(".")[0].lower()
+
+
+def log(line: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d ") + clock(now())
+    with LOG_FILE.open("a") as f:
+        f.write(f"{stamp} {line}\n")
+
+
+def clock(ts: float) -> str:
+    t = time.localtime(ts)
+    return f"{(t.tm_hour % 12) or 12}:{t.tm_min:02d}{'am' if t.tm_hour < 12 else 'pm'}"
+
+
+def human_bytes(n: int | None) -> str:
+    if n is None:
+        return "?"
+    for unit, size in (("TB", 10**12), ("GB", GB), ("MB", 10**6), ("KB", 10**3)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} B"
+
+
+def human_age(s: float) -> str:
+    s = max(0, int(s))
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s / 86400:.1f}d"
+
+
+def parse_ttl(text: str) -> float:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*", str(text))
+    if not m:
+        raise ValueError(f"bad ttl {text!r} (use e.g. 30m, 24h, 3d, 1w)")
+    return (
+        float(m.group(1))
+        * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    )
+
+
+def parse_size(text: str) -> int:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(GiB|GB|G|TiB|TB|T)?\s*", str(text), re.I)
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad size {text!r} (e.g. 30, 30GB, 50GiB)")
+    unit = (m.group(2) or "GB").lower()
+    mult = {"gib": GIB, "gb": GB, "g": GB, "tib": 2**40, "tb": 10**12, "t": 10**12}[
+        unit
+    ]
+    return int(float(m.group(1)) * mult)
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, delete=False, prefix=".tmp-"
+    ) as tmp:
+        json.dump(value, tmp, indent=2)
+        tmp.write("\n")
+    os.replace(tmp.name, path)
+
+
+# --- config ----------------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    roots: list[Path]
+    floor: int
+    target: int
+    move_root: str | None
+    deny_paths: list[str]
+    deny_names: list[str]
+    deny_sequences: list[tuple[str, ...]] = field(default_factory=list)
+    deny_exact: list[str] = field(default_factory=list)
+    volume_floors: dict[str, int] = field(default_factory=dict)
+    holders: list[dict] = field(default_factory=list)
+    job_done: dict | None = None
+    export_list: Path | None = None
+    export_format: str = "{path}"
+    remote_command: list[str] = field(
+        default_factory=lambda: list(DEFAULT_REMOTE_COMMAND)
+    )
+    session_grace: float | None = None
+
+
+def _strings(raw: dict, key: str) -> list[str]:
+    value = raw.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise SystemExit(f"reclaimable: config key {key!r} must be a list of strings")
+    return value
+
+
+def _command(table: dict, where: str) -> list[str]:
+    cmd = table.get("command")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        raise SystemExit(f"reclaimable: {where} needs command = [..] (list of strings)")
+    return cmd
+
+
+def _size_key(raw: dict, name: str, default: int) -> int:
+    """`NAME = "30GB"` or `NAME_gb = 30`."""
+    if f"{name}_gb" in raw:
+        return int(float(raw[f"{name}_gb"]) * GB)
+    if name in raw:
+        return parse_size(str(raw[name]))
+    return default
+
+
+HOST_OVERRIDE = (
+    "floor",
+    "floor_gb",
+    "target",
+    "target_gb",
+    "move_root",
+    "roots",
+    "volume_floors",
+)
+HOST_ADDITIVE = ("deny", "deny_names", "deny_exact")
+
+
+def apply_host_section(raw: dict) -> dict:
+    """Overlay `[hosts.<hostname>]` (first label, lowercase) on the top-level keys."""
+    hosts = raw.get("hosts", {})
+    if not isinstance(hosts, dict):
+        raise SystemExit("reclaimable: [hosts] must hold [hosts.<hostname>] tables")
+    mine = {str(k).lower(): v for k, v in hosts.items()}.get(hostname())
+    if mine is None:
+        return raw
+    if not isinstance(mine, dict):
+        raise SystemExit(f"reclaimable: [hosts.{hostname()}] must be a table")
+    out = dict(raw)
+    for family in (("floor", "floor_gb"), ("target", "target_gb")):
+        if any(k in mine for k in family):
+            for k in family:
+                out.pop(k, None)
+    for key in HOST_OVERRIDE:
+        if key in mine:
+            out[key] = mine[key]
+    for key in HOST_ADDITIVE:
+        if key in mine:
+            out[key] = list(raw.get(key, [])) + list(mine[key])
+    return out
+
+
+def load_config(path: Path | None = None) -> Config:
+    path = CONFIG_FILE if path is None else path
+    try:
+        raw = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise SystemExit(f"reclaimable: cannot read {path}: {e}") from e
+    raw = apply_host_section(raw)
+    roots = [expand(r) for r in _strings(raw, "roots")] or default_roots()
+    floor = _size_key(raw, "floor", DEFAULT_FLOOR)
+    target = _size_key(raw, "target", floor + TARGET_MARGIN)
+    ttls = raw.get("default_ttls", {})
+    if not isinstance(ttls, dict) or set(ttls) - set(KINDS):
+        raise SystemExit(f"reclaimable: default_ttls keys must be among {KINDS}")
+    for kind, ttl in ttls.items():
+        parse_ttl(ttl)
+        DEFAULT_TTL[kind] = ttl
+    sequences = []
+    for seq in raw.get("deny_sequences", []):
+        if (
+            not isinstance(seq, list)
+            or not seq
+            or not all(isinstance(x, str) for x in seq)
+        ):
+            raise SystemExit("reclaimable: deny_sequences must be lists of names")
+        sequences.append(tuple(seq))
+    holders = raw.get("holder", [])
+    if not isinstance(holders, list) or not all(isinstance(h, dict) for h in holders):
+        raise SystemExit("reclaimable: [[holder]] entries must be tables")
+    for i, h in enumerate(holders):
+        if "command" in h:
+            _command(h, f"[[holder]] #{i + 1}")
+        elif "lease_dir" not in h:
+            raise SystemExit(
+                f"reclaimable: [[holder]] #{i + 1} needs command or lease_dir"
+            )
+    job_done = raw.get("job_done")
+    if job_done is not None:
+        if not isinstance(job_done, dict):
+            raise SystemExit("reclaimable: [job_done] must be a table")
+        _command(job_done, "[job_done]")
+    grace = raw.get("session_grace")
+    session_grace = None if grace is None else parse_ttl(str(grace))
+    export = raw.get("exclude_list_path")
+    remote = raw.get("remote_command")
+    if remote is not None:
+        _command({"command": remote}, "remote_command")
+    return Config(
+        roots=roots,
+        floor=floor,
+        target=max(target, floor),
+        move_root=raw.get("move_root"),
+        # The config can only add to the deny-lists, never remove.
+        deny_paths=DENY_PATHS + _strings(raw, "deny"),
+        deny_names=DENY_NAMES + _strings(raw, "deny_names"),
+        deny_sequences=list(DENY_SEQUENCES) + sequences,
+        deny_exact=BROAD + _strings(raw, "deny_exact"),
+        volume_floors={
+            str(expand(k)): parse_size(str(v))
+            for k, v in raw.get("volume_floors", {}).items()
+        },
+        holders=holders,
+        job_done=job_done,
+        export_list=expand(export) if export else None,
+        export_format=str(raw.get("exclude_list_format", "{path}")),
+        remote_command=list(remote or DEFAULT_REMOTE_COMMAND),
+        session_grace=session_grace,
+    )
+
+
+def default_roots() -> list[Path]:
+    roots = [HOME]
+    for vol in sorted(Path("/Volumes").glob("*")):
+        try:
+            if vol.is_symlink() or not vol.is_dir() or not os.path.ismount(vol):
+                continue
+            if (vol / "Backups.backupdb").exists() or (vol / ".timemachine").exists():
+                continue
+            if os.access(vol, os.R_OK | os.W_OK | os.X_OK):
+                roots.append(vol)
+        except OSError:
+            continue
+    return roots
+
+
+# --- marker ----------------------------------------------------------------------
+
+
+@dataclass
+class Marker:
+    folder: Path
+    owner: str
+    ttl: str | None = None
+    regenerate: str = ""
+    kind: str | None = None
+    job: str | None = None
+    session: str | None = None
+    move_to: str | None = None
+    holds: list[dict] = field(default_factory=list)
+    mtime: float = 0.0
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def path(self) -> Path:
+        return self.folder / MARKER
+
+    @property
+    def effective_kind(self) -> str:
+        return self.kind or "cache"
+
+    @property
+    def ttl_seconds(self) -> float:
+        return parse_ttl(self.ttl or DEFAULT_TTL[self.effective_kind])
+
+    def to_json(self) -> dict:
+        data = dict(self.extra)
+        data.update(owner=self.owner, regenerate=self.regenerate, holds=self.holds)
+        for key in ("ttl", "kind", "job", "session", "move_to"):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+            else:
+                data.pop(key, None)
+        return data
+
+
+def read_marker(folder: Path) -> Marker:
+    path = folder / MARKER
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("marker is not a JSON object")
+    if not isinstance(data.get("owner"), str) or not data["owner"].strip():
+        raise ValueError("marker needs an owner")
+    if not isinstance(data.get("regenerate"), str) or not data["regenerate"].strip():
+        raise ValueError("marker needs a regenerate description")
+    if "ignored_ok" in data and not isinstance(data["ignored_ok"], bool):
+        raise ValueError("ignored_ok must be true or false")
+    kind = data.get("kind")
+    if kind is not None and kind not in KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+    if data.get("ttl") is not None:
+        parse_ttl(data["ttl"])
+    holds = data.get("holds") or []
+    if not isinstance(holds, list) or not all(isinstance(h, dict) for h in holds):
+        raise ValueError("holds must be a list of objects")
+    known = {"owner", "ttl", "regenerate", "kind", "job", "session", "move_to", "holds"}
+    return Marker(
+        folder=folder,
+        owner=data["owner"],
+        ttl=data.get("ttl"),
+        regenerate=data["regenerate"],
+        kind=kind,
+        job=None if data.get("job") is None else str(data["job"]),
+        session=None if data.get("session") is None else str(data["session"]),
+        move_to=data.get("move_to"),
+        holds=holds,
+        mtime=path.stat().st_mtime,
+        extra={k: v for k, v in data.items() if k not in known},
+    )
+
+
+def write_marker(marker: Marker) -> None:
+    with tempfile.NamedTemporaryFile(
+        "w", dir=marker.folder, delete=False, prefix=".reclaimable-"
+    ) as tmp:
+        json.dump(marker.to_json(), tmp, indent=2)
+        tmp.write("\n")
+    os.replace(tmp.name, marker.path)
+    marker.mtime = marker.path.stat().st_mtime
+
+
+# --- deny-list ---------------------------------------------------------------------
+
+
+def _deny_name_hit(parts, cfg: Config) -> str | None:
+    for part in parts:
+        for pat in cfg.deny_names:
+            if pmatch(part, pat):
+                return part
+    folded = [fold(x) for x in parts]
+    for seq in cfg.deny_sequences:
+        n = len(seq)
+        want = [fold(x) for x in seq]
+        for i in range(len(folded) - n + 1):
+            if folded[i : i + n] == want:
+                return "/".join(seq)
+    return None
+
+
+def deny_reason(path: Path, cfg: Config) -> str | None:
+    """Why `path` itself may never be marked or removed (None when allowed).
+
+    Strings are compared case-folded and Unicode-normalised, and protected paths
+    (and their ancestors) are also compared by filesystem identity (device+inode),
+    so case variants, NFD spellings and firmlink aliases can't dodge them."""
+    path = expand(path)
+    link = next((p for p in (path, *path.parents) if p.is_symlink()), None)
+    if link is not None:
+        return f"symlink in path ({link}); mark the real directory"
+    real = strip_data(os.path.realpath(path))
+    protected = protected_identities(cfg)
+    for candidate in {path, real}:
+        chain = [candidate, *candidate.parents]
+        chain_ids = [identity(p) for p in chain]
+        cand_id = chain_ids[0]
+        for raw in cfg.deny_exact:
+            target = expand(raw)
+            if fold(str(candidate)) == fold(str(target)) or (
+                cand_id is not None and cand_id == identity(target)
+            ):
+                return f"broad folder {raw}"
+        if fold(str(candidate.parent)) in ("/users", "/volumes"):
+            return "home or volume root"
+        for ident in chain_ids:
+            if ident is not None and ident in protected:
+                return "deny-list (same directory as a protected path)"
+        for raw in cfg.deny_paths:
+            pattern = str(expand(raw))
+            # The path is (inside) a denied path, or contains one.
+            for anc in chain:
+                if pmatch(str(anc), pattern):
+                    return f"deny-list {raw}"
+            if str(candidate) != "/" and pmatch(pattern + "/", str(candidate) + "/*"):
+                return f"contains deny-listed {raw}"
+            base = pattern.split("*")[0]
+            if "*" in pattern and fold(base).startswith(fold(str(candidate)) + "/"):
+                return f"may contain deny-listed {raw}"
+            if not glob.has_magic(pattern) and cand_id is not None:
+                target = expand(raw)
+                if cand_id in {identity(p) for p in (target, *target.parents)}:
+                    return f"contains deny-listed {raw}"
+        if any(fold(p) in DENY_SELF_NAMES for p in candidate.parts):
+            return "inside a .git/.jj dir"
+        hit = _deny_name_hit(candidate.parts, cfg)
+        if hit:
+            return f"deny-listed name {hit}"
+    return None
+
+
+# --- registry ------------------------------------------------------------------------
+
+
+def load_registry() -> dict:
+    reg = load_json(REGISTRY, {})
+    reg.setdefault("markers", {})
+    return reg
+
+
+def save_registry(reg: dict) -> None:
+    write_json(REGISTRY, reg)
+
+
+def register(folder: Path) -> None:
+    with state_lock():
+        reg = load_registry()
+        reg["markers"].setdefault(str(folder), {"registered": now()})
+        save_registry(reg)
+        write_export_list(reg, load_config())
+
+
+@contextlib.contextmanager
+def hold_lock():
+    """Serialises `hold`/`release` with the janitor's final check-and-remove step."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "hold.lock").open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+@contextlib.contextmanager
+def state_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "state.lock").open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def scan(
+    roots: list[Path], cfg: Config, limit_s: float = SCAN_LIMIT_S
+) -> tuple[set[str], bool]:
+    """Find marker folders; prunes deny-listed trees and never descends into marked folders."""
+    found: set[str] = set()
+    deadline = time.monotonic() + limit_s
+    prune_paths = {str(expand(p)) for p in SCAN_PRUNE_PATHS}
+    complete = True
+    for root in roots:
+        stack = [(root, 0)]
+        root_dev = None
+        with contextlib.suppress(OSError):
+            root_dev = root.stat().st_dev
+        while stack:
+            if time.monotonic() > deadline:
+                return found, False
+            folder, depth = stack.pop()
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            if any(
+                e.name == MARKER and e.is_file(follow_symlinks=False) for e in entries
+            ):
+                found.add(str(folder))
+                continue
+            if depth >= SCAN_MAX_DEPTH:
+                complete = False
+                continue
+            for e in entries:
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    if e.name in SCAN_PRUNE_NAMES or e.name.endswith(
+                        (".app", ".photoslibrary")
+                    ):
+                        continue
+                    if e.path in prune_paths:
+                        continue
+                    if (
+                        root_dev is not None
+                        and e.stat(follow_symlinks=False).st_dev != root_dev
+                    ):
+                        continue
+                    if any(pmatch(e.path, str(expand(p))) for p in cfg.deny_paths):
+                        continue
+                except OSError:
+                    continue
+                stack.append((Path(e.path), depth + 1))
+    return found, complete
+
+
+def discover(
+    cfg: Config, reg: dict, force_scan: bool = False, roots: list[Path] | None = None
+) -> list[Path]:
+    if force_scan or roots or now() - reg.get("last_scan", 0) > SCAN_EVERY_S:
+        found, complete = scan(roots or cfg.roots, cfg)
+        for f in found:
+            reg["markers"].setdefault(f, {"registered": now()})
+        if not roots:
+            reg["last_scan"] = now()
+            reg["last_scan_complete"] = complete
+    folders = []
+    for f in list(reg["markers"]):
+        if not os.path.isabs(f):
+            # Ambiguous (relative to whichever directory registered it): never act on it.
+            log(f"ignoring relative registry path {f!r}")
+            continue
+        norm = str(expand(f))
+        if norm != f:
+            reg["markers"].setdefault(norm, reg["markers"].pop(f))
+            f = norm
+        p = Path(f)
+        if p in folders:
+            continue
+        if (p / MARKER).is_file():
+            if not roots or any(p == r or r in p.parents for r in roots):
+                folders.append(p)
+        else:
+            del reg["markers"][f]
+    return sorted(folders)
+
+
+def export_ok(path: Path) -> bool:
+    """Skip paths a downstream consumer would likely reject: symlinks, mounts, roots."""
+    try:
+        if any(p.is_symlink() for p in (path, *path.parents)) or path.is_mount():
+            return False
+    except OSError:
+        return False
+    return path.parent not in (Path("/Users"), Path("/Volumes")) and path != HOME
+
+
+def write_export_list(reg: dict, cfg: Config) -> None:
+    """Optional: write every registered, non-denied marked folder to `exclude_list_path`."""
+    if cfg.export_list is None:
+        return
+    lines = [
+        "# Generated by reclaimable from registered .reclaimable markers; do not edit."
+    ]
+    for f in sorted(reg["markers"]):
+        p = Path(f)
+        if (p / MARKER).is_file() and not deny_reason(p, cfg) and export_ok(p):
+            lines.append(cfg.export_format.replace("{path}", f))
+    text = "\n".join(lines) + "\n"
+    if not cfg.export_list.exists() or cfg.export_list.read_text() != text:
+        cfg.export_list.parent.mkdir(parents=True, exist_ok=True)
+        cfg.export_list.write_text(text)
+
+
+# --- safety checks -----------------------------------------------------------------------
+
+
+def run(
+    cmd: list[str], timeout: float = 60, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def related(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def open_files(folder: Path) -> str | None:
+    """None when nothing has files open under folder; otherwise a reason (fails closed)."""
+    if not shutil.which("lsof"):
+        return "lsof unavailable"
+    try:
+        res = run(
+            ["lsof", "-w", "-n", "-P", "-F", "pcn", "+D", str(folder)],
+            timeout=LSOF_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return "lsof timed out"
+    if res.returncode not in (0, 1):
+        return f"lsof failed ({res.returncode})"
+    procs = []
+    pid = cmd = None
+    for line in res.stdout.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c"):
+            cmd = line[1:]
+            procs.append(f"{cmd}[{pid}]")
+    if res.stdout.strip():
+        return "open files: " + ", ".join(sorted(set(procs))[:5] or ["?"])
+    return None
+
+
+def process_cwd(pid: int) -> Path | None:
+    try:
+        res = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=15)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    for line in res.stdout.splitlines():
+        if line.startswith("n/"):
+            return Path(line[1:])
+    return None
+
+
+def _paths_in(value) -> list[Path]:
+    out = []
+    if isinstance(value, str) and ("/" in value or value.startswith("~")):
+        for token in re.split(r"[\s=:]+", value):
+            if token.startswith(("/", "~/")):
+                out.append(expand(token))
+    elif isinstance(value, list):
+        for v in value:
+            out += _paths_in(v)
+    return out
+
+
+class Unreadable(Exception):
+    pass
+
+
+def list_dir(path: Path) -> list[os.DirEntry]:
+    """Entries of `path`; [] if it does not exist; Unreadable if it can't be listed."""
+    try:
+        return list(os.scandir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError as e:
+        raise Unreadable(f"{path}: {e.strerror}") from e
+
+
+def expand_dirs(pattern: str) -> list[Path]:
+    """Directories matching a path or glob, raising Unreadable (never silently
+    skipping) when a directory on the way can't be listed."""
+    parts = Path(pattern).expanduser().parts
+    found = [Path(parts[0])] if parts else []
+    for part in parts[1:]:
+        nxt: list[Path] = []
+        for base in found:
+            if glob.has_magic(part):
+                nxt += [
+                    Path(e.path)
+                    for e in sorted(list_dir(base), key=lambda e: e.name)
+                    if pmatch(e.name, part)
+                ]
+            else:
+                nxt.append(base / part)
+        found = nxt
+    out = []
+    for p in found:
+        try:
+            os.stat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            raise Unreadable(f"{p}: {e.strerror}") from e
+        out.append(p)
+    return out
+
+
+def json_files(path: Path) -> list[Path]:
+    return sorted(Path(e.path) for e in list_dir(path) if e.name.endswith(".json"))
+
+
+def lease_hold(holder: dict, marker: Marker) -> str | None:
+    """Live leases (JSON files with pid/job/log/what) that reference the folder or its job.
+
+    A lease is a `*.json` file in `lease_dir` (a path or glob, or a list of them)
+    holding `pid` (required) and optionally `job`/`issue`, `log`, `what` (strings or
+    lists with paths) and `claim_id`. A lease whose pid is dead is ignored. With
+    `claim_dir`, `claim_id` names `claim_dir/<id>.json` (`cwd`, `command`), and
+    claim records in state `starting`/`running` hold paths they reference even
+    before they have a lease. Unreadable lease state fails closed (held)."""
+    folder = marker.folder
+    job = (marker.job or "").lstrip("#")
+    lease_dirs = holder["lease_dir"]
+    if isinstance(lease_dirs, str):
+        lease_dirs = [lease_dirs]
+    dirs: list[Path] = []
+    try:
+        for pattern in lease_dirs:
+            dirs += expand_dirs(pattern)
+    except Unreadable as e:
+        return f"lease dir unreadable ({e})"
+    claim_dirs = holder.get("claim_dir", [])
+    claim_dirs = [claim_dirs] if isinstance(claim_dirs, str) else claim_dirs
+    claim_dirs = [expand(p) for p in claim_dirs]
+    for lease_dir in dirs:
+        try:
+            files = json_files(lease_dir)
+        except Unreadable as e:
+            return f"lease dir unreadable ({e})"
+        for path in files:
+            try:
+                lease = json.loads(path.read_text())
+                pid = int(lease["pid"])
+            except (OSError, ValueError, KeyError, TypeError):
+                return f"unreadable lease {path.name}"
+            if not pid_alive(pid):
+                continue
+            name = f"lease {path.name} ({lease.get('job') or '?'})"
+            if job and job in {
+                str(lease.get("job") or ""),
+                str(lease.get("issue") or ""),
+            }:
+                return f"{name} is this job"
+            refs = _paths_in(lease.get("log")) + _paths_in(lease.get("what"))
+            claim = lease.get("claim_id")
+            if claim:
+                for claim_dir in claim_dirs:
+                    rec_path = claim_dir / f"{claim}.json"
+                    try:
+                        rec = json.loads(rec_path.read_text())
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError):
+                        return f"unreadable claim record {rec_path.name}"
+                    refs += _paths_in(rec.get("cwd")) + _paths_in(rec.get("command"))
+            cwd = process_cwd(pid)
+            if cwd:
+                refs.append(cwd)
+            for ref in refs:
+                if related(ref, folder):
+                    return f"{name} uses {ref}"
+    # Claims still starting (no lease yet).
+    for claim_dir in claim_dirs:
+        try:
+            recs = json_files(claim_dir)
+        except Unreadable as e:
+            return f"claim dir unreadable ({e})"
+        for rec_path in recs:
+            try:
+                rec = json.loads(rec_path.read_text())
+            except (OSError, ValueError):
+                return f"unreadable claim record {rec_path.name}"
+            if rec.get("state") not in ("starting", "running"):
+                continue
+            if (
+                rec.get("state") == "running"
+                and rec.get("pid")
+                and not pid_alive(int(rec["pid"]))
+            ):
+                continue
+            for ref in _paths_in(rec.get("cwd")) + _paths_in(rec.get("command")):
+                if related(ref, folder):
+                    return f"claim {rec_path.stem} uses {ref}"
+    return None
+
+
+def _fill(arg: str, **values: str) -> str:
+    """Expand a leading `~/` and `{name}` placeholders (plus `{config_dir}`, the
+    directory holding the config file, so helper scripts can sit next to it)."""
+    arg = str(Path(arg).expanduser()) if arg.startswith("~/") else arg
+    arg = arg.replace("{config_dir}", str(CONFIG_FILE.resolve().parent))
+    for key, value in values.items():
+        arg = arg.replace("{" + key + "}", value)
+    return arg
+
+
+def command_hold(holder: dict, marker: Marker) -> str | None:
+    """Run a holder command: exit 0 = held, 1 = free, anything else (or a failure
+    to run) = held. `{path}` (alias `{folder}`), `{owner}`, `{job}`, `{session}`, `{kind}` in
+    arguments and RECLAIMABLE_PATH/_FOLDER/_OWNER/_JOB/_SESSION/_KIND in the
+    environment carry the marker."""
+    values = {
+        "folder": str(marker.folder),
+        "path": str(marker.folder),
+        "job": marker.job or "",
+        "owner": marker.owner,
+        "session": marker.session or "",
+        "kind": marker.effective_kind,
+    }
+    cmd = [_fill(a, **values) for a in holder["command"]]
+    name = holder.get("name") or Path(cmd[0]).name
+    env = {
+        **os.environ,
+        **{f"RECLAIMABLE_{k.upper()}": v for k, v in values.items()},
+    }
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=float(holder.get("timeout", HOLDER_TIMEOUT_S)),
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"holder {name} timed out"
+    except OSError as e:
+        return f"holder {name} failed to run ({e.strerror})"
+    if res.returncode == 1:
+        return None
+    detail = (res.stdout.strip().splitlines() or [""])[0][:100]
+    if res.returncode == 0:
+        return f"holder {name}" + (f": {detail}" if detail else "")
+    return f"holder {name} exited {res.returncode} (treated as held)"
+
+
+def holder_hold(marker: Marker, cfg: Config) -> str | None:
+    for holder in cfg.holders:
+        reason = (
+            command_hold(holder, marker)
+            if "command" in holder
+            else lease_hold(holder, marker)
+        )
+        if reason:
+            return reason
+    return None
+
+
+def parse_closed_at(text: str) -> float | None:
+    """Epoch seconds, or an ISO 8601 UTC time like 2026-10-01T00:00:00Z."""
+    text = text.strip()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text)
+    try:
+        return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
+
+
+def job_closed(
+    job: str, cfg: Config, reg: dict, fresh: bool = False
+) -> tuple[bool | None, float | None, str]:
+    """(closed?, closed_at, detail) from the configured `job_done` command.
+
+    Exit 0 = job closed (first stdout line may give the close time), 1 = still
+    open, anything else = unknown. None when it can't be resolved. A positive
+    answer is cached for an hour unless `fresh` (used right before removal), which
+    always runs the command and drops the cached answer on anything but closed."""
+    if not cfg.job_done:
+        return None, None, "no job_done command configured"
+    cache = reg.setdefault("jobs", {})
+    hit = cache.get(job)
+    if (
+        not fresh
+        and hit
+        and hit.get("closed")
+        and now() - hit.get("checked", 0) < 3600
+    ):
+        return True, hit.get("closed_at"), "closed"
+    first_seen = (hit or {}).get("first_closed_seen")
+    cmd = [_fill(a, job=job) for a in cfg.job_done["command"]]
+    env = {**os.environ, "RECLAIMABLE_JOB": job}
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=float(cfg.job_done.get("timeout", JOB_TIMEOUT_S)),
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        cache.pop(job, None)
+        return None, None, "job_done timed out"
+    except OSError as e:
+        cache.pop(job, None)
+        return None, None, f"job_done failed to run ({e.strerror})"
+    if res.returncode not in (0, 1):
+        cache.pop(job, None)
+        return None, None, f"job_done exited {res.returncode}"
+    closed = res.returncode == 0
+    closed_at = (
+        parse_closed_at(res.stdout.splitlines()[0])
+        if closed and res.stdout.strip()
+        else None
+    )
+    record = {"closed": closed, "closed_at": closed_at, "checked": now()}
+    if closed and closed_at is None:
+        # No usable close time: count from the first time we saw it closed (kept in
+        # the registry), never from the marker's older mtime.
+        first_seen = first_seen or now()
+        record["first_closed_seen"] = first_seen
+        closed_at = record["closed_at"] = first_seen
+    cache[job] = record
+    return closed, closed_at, "closed" if closed else "open"
+
+
+NO_MATCH = "no-match"
+
+
+def session_running(session: str) -> bool | str | None:
+    """True (alive), False (gone), NO_MATCH (the process list was searched successfully
+    and nothing matched), or None (unknown: the search could not be done).
+
+    A numeric session is a pid and is checked exactly. Any other id is matched
+    against the process list; a miss does not prove the session ended (its id may
+    never appear in a command line), so only a hit is conclusive: a miss is
+    unknown, which keeps the folder."""
+    if session.isdigit():
+        return pid_alive(int(session))
+    if not shutil.which("pgrep"):
+        return None
+    try:
+        res = run(["pgrep", "-f", "--", session], timeout=15)
+    except subprocess.TimeoutExpired:
+        return None
+    if res.returncode not in (0, 1):
+        return None
+    pids = [int(p) for p in res.stdout.split() if p.isdigit() and int(p) != os.getpid()]
+    return True if pids else NO_MATCH
+
+
+def _changes(output: str, porcelain: bool = False) -> list[str]:
+    """Changed paths, ignoring the marker itself (it lives in the checkout it governs)."""
+    out = []
+    for line in output.splitlines():
+        path = line[3:] if porcelain else line.strip()
+        if path and path != MARKER:
+            out.append(path)
+    return out
+
+
+def repo_state(folder: Path) -> tuple[str | None, str | None]:
+    """(type, problem) for a git/jj checkout at folder. type in git-linked, git-primary, jj-secondary, jj-primary."""
+    jj, git = folder / ".jj", folder / ".git"
+    if jj.is_dir():
+        kind = "jj-secondary" if (jj / "repo").is_file() else "jj-primary"
+        try:
+            d = run(
+                [
+                    "jj",
+                    "-R",
+                    str(folder),
+                    "--ignore-working-copy",
+                    "diff",
+                    "--name-only",
+                ],
+                timeout=60,
+            )
+            if d.returncode != 0:
+                return kind, "jj diff failed"
+            # jj snapshots lazily; compare against the working copy too.
+            s = run(["jj", "-R", str(folder), "diff", "--name-only"], timeout=120)
+            if s.returncode != 0 or _changes(d.stdout) or _changes(s.stdout):
+                return kind, "dirty (jj diff non-empty)"
+            u = run(
+                [
+                    "jj",
+                    "-R",
+                    str(folder),
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-T",
+                    'commit_id ++ "\\n"',
+                    "-r",
+                    "(::@ ~ ::remote_bookmarks()) ~ empty() ~ root()",
+                ],
+                timeout=60,
+            )
+            if u.returncode != 0:
+                return kind, "jj log failed"
+            if u.stdout.strip():
+                return kind, "unpushed jj commits"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return kind, "jj unavailable or timed out"
+        return kind, None
+    if git.exists():
+        kind = "git-linked" if git.is_file() else "git-primary"
+        try:
+            st = run(["git", "-C", str(folder), "status", "--porcelain"], timeout=120)
+            if st.returncode != 0:
+                return kind, "git status failed"
+            if _changes(st.stdout, porcelain=True):
+                return kind, "dirty (git status non-empty)"
+            un = run(
+                [
+                    "git",
+                    "-C",
+                    str(folder),
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                ],
+                timeout=60,
+            )
+            if un.returncode != 0:
+                return kind, "git rev-list failed"
+            if un.stdout.strip() != "0":
+                return kind, f"{un.stdout.strip()} unpushed commits"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return kind, "git unavailable or timed out"
+        return kind, None
+    return None, None
+
+
+def ignored_files(folder: Path, repo: str) -> str | None:
+    """A reason when the checkout holds files its ignore rules hide (None when it has
+    none). Those aren't covered by the clean/pushed checks and may be irreplaceable.
+    Errors fail closed."""
+    try:
+        if repo.startswith("git"):
+            res = run(
+                ["git", "-C", str(folder), "status", "--porcelain", "--ignored"],
+                timeout=120,
+            )
+            if res.returncode != 0:
+                return "git status --ignored failed"
+            for line in res.stdout.splitlines():
+                if line.startswith("!! ") and line[3:].rstrip("/") != MARKER:
+                    return f"contains ignored files; marker lacks ignored_ok ({line[3:]})"
+            return None
+        res = run(
+            ["jj", "--ignore-working-copy", "file", "list"],
+            timeout=120,
+            cwd=folder,
+        )
+        if res.returncode != 0:
+            return "jj file list failed"
+        tracked = set(res.stdout.splitlines())
+        for d, dirs, files in os.walk(folder):
+            rel_dir = os.path.relpath(d, folder)
+            if rel_dir == ".":
+                rel_dir = ""
+                dirs[:] = [x for x in dirs if x not in (".jj", ".git")]
+            for name in files:
+                rel = os.path.join(rel_dir, name)
+                if rel != MARKER and rel not in tracked:
+                    return f"contains ignored files; marker lacks ignored_ok ({rel})"
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "ignored-file check unavailable"
+
+
+@dataclass
+class Walk:
+    size: int | None
+    files: int
+    problem: str | None
+    repos: list[Path]
+    crossed: list[Path] = field(default_factory=list)
+
+
+def walk(
+    folder: Path, cfg: Config, check_names: bool, limit_s: float = WALK_LIMIT_S
+) -> Walk:
+    """Disk usage plus deny-listed descendants and nested repos; incomplete walks fail closed."""
+    size = files = 0
+    repos: list[Path] = []
+    crossed: list[Path] = []
+    seen: set[tuple[int, int]] = set()
+    deadline = time.monotonic() + limit_s
+    dev = folder.lstat().st_dev
+    patterns = [str(expand(p)) for p in cfg.deny_paths]
+    protected = protected_identities(cfg)
+    stack = [folder]
+    while stack:
+        if time.monotonic() > deadline:
+            return Walk(None, files, "size walk timed out", repos)
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError as e:
+            return Walk(None, files, f"unreadable {d}: {e.strerror}", repos)
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            files += 1
+            # A hardlinked file is one allocation however many names it has here.
+            if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
+                if (st.st_dev, st.st_ino) not in seen:
+                    seen.add((st.st_dev, st.st_ino))
+                    size += st.st_blocks * 512
+            else:
+                size += st.st_blocks * 512
+            rel = Path(e.path).relative_to(folder).parts
+            hit_path = any(pmatch(e.path, pattern) for pattern in patterns)
+            if hit_path or (st.st_dev, st.st_ino) in protected:
+                return Walk(None, files, f"contains deny-listed {'/'.join(rel)}", repos)
+            if check_names:
+                hit = _deny_name_hit(rel, cfg)
+                if hit:
+                    return Walk(
+                        None, files, f"contains deny-listed {'/'.join(rel)}", repos
+                    )
+            if fold(e.name) in (".git", ".jj") and d != folder:
+                repos.append(Path(d))
+            if e.is_dir(follow_symlinks=False):
+                if st.st_dev == dev:
+                    stack.append(Path(e.path))
+                else:
+                    crossed.append(Path(e.path))
+    return Walk(size, files, None, sorted(set(repos)), crossed)
+
+
+@dataclass
+class Verdict:
+    marker: Marker | None
+    folder: Path
+    last_used: float = 0.0
+    clock_start: float = 0.0
+    ttl_s: float = 0.0
+    expired: bool = False
+    safe: bool = False
+    reason: str = ""
+    size: int | None = None
+    repo: str | None = None
+    action: str = "keep"  # keep | delete | move
+    dest: str | None = None
+
+    def row(self) -> dict:
+        m = self.marker
+        return {
+            "path": str(self.folder),
+            "owner": m.owner if m else None,
+            "kind": m.effective_kind if m else None,
+            "job": m.job if m else None,
+            "last_used": self.last_used,
+            "age_s": now() - self.last_used if self.last_used else None,
+            "ttl": (m.ttl or DEFAULT_TTL[m.effective_kind]) if m else None,
+            "expired": self.expired,
+            "safe": self.safe,
+            "size": self.size,
+            "action": self.action,
+            "dest": self.dest,
+            "reason": self.reason,
+        }
+
+
+def session_problem(
+    m: Marker, cfg: Config, entry: dict, closed_at: float | None
+) -> str | None:
+    """Why the marker's session isn't known to be gone (None when it is; the time it
+    was first seen gone is then in entry["session_exit_seen"]).
+
+    A numeric session is a pid, checked exactly. A non-numeric one counts as gone
+    only after a successful process-list search found nothing AND `session_grace`
+    has elapsed since the job's (recorded or first observed) close time."""
+    assert m.session
+    label = m.session[:12]
+    running = session_running(m.session)
+    if (
+        running == NO_MATCH
+        and cfg.session_grace is not None
+        and m.job
+        and not m.session.isdigit()
+    ):
+        if not closed_at:
+            entry.pop("session_exit_seen", None)
+            return f"session {label} unknown and job close time unavailable"
+        ready = closed_at + cfg.session_grace
+        if now() < ready:
+            entry.pop("session_exit_seen", None)
+            return (
+                f"session {label} within grace "
+                f"(job closed {human_age(now() - closed_at)} ago, "
+                f"grace {human_age(cfg.session_grace)})"
+            )
+        running = False
+        entry.setdefault("session_exit_seen", ready)
+    if running is None or running == NO_MATCH:
+        entry.pop("session_exit_seen", None)
+        return f"session {label} state unknown"
+    if running:
+        entry.pop("session_exit_seen", None)
+        return f"session {label} still running"
+    entry.setdefault("session_exit_seen", now())
+    return None
+
+
+def tree_problem(
+    folder: Path, m: Marker, cfg: Config, w: Walk
+) -> tuple[str | None, str | None]:
+    """(reason to keep, repo type) from a fresh walk: incomplete or cross-filesystem
+    walks, deny-listed content, and dirty/unpushed/primary repos (the folder itself
+    and nested ones). Shared by evaluation and the final pre-removal re-check."""
+    if w.problem:
+        return w.problem, None
+    if w.crossed:
+        return f"contains another filesystem at {w.crossed[0].relative_to(folder)}", None
+    repo, problem = repo_state(folder)
+    if problem:
+        return f"worktree {problem}", repo
+    if repo in ("git-primary", "jj-primary"):
+        return (
+            f"{repo} repository (only linked worktrees / secondary workspaces are removable)",
+            repo,
+        )
+    if m.effective_kind == "worktree" and repo is None:
+        return "kind worktree but no .git/.jj found", repo
+    ignored_ok = m.extra.get("ignored_ok") is True
+    if repo and not ignored_ok:
+        hidden = ignored_files(folder, repo)
+        if hidden:
+            return hidden, repo
+    for nested in w.repos[:20]:
+        nested_kind, problem = repo_state(nested)
+        if problem:
+            return f"nested repo {nested.relative_to(folder)} {problem}", repo
+        if nested_kind in ("git-linked", "jj-secondary") and not ignored_ok:
+            hidden = ignored_files(nested, nested_kind)
+            if hidden:
+                return (
+                    f"nested repo {nested.relative_to(folder)} {hidden}",
+                    repo,
+                )
+        if nested_kind in ("git-primary", "jj-primary"):
+            return (
+                f"nested {nested_kind} repository {nested.relative_to(folder)} "
+                "(only linked worktrees / secondary workspaces are removable)",
+                repo,
+            )
+    if len(w.repos) > 20:
+        return f"{len(w.repos)} nested repos (too many to verify)", repo
+    return None, repo
+
+
+def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict:
+    """Cheap checks first; deep=True adds the walk, lease, lsof and repo checks."""
+    folder = expand(folder)
+    v = Verdict(marker=None, folder=folder)
+    try:
+        m = read_marker(folder)
+    except (OSError, ValueError) as e:
+        v.reason = f"bad marker: {e}"
+        return v
+    v.marker = m
+    v.last_used = m.mtime
+    entry = reg["markers"].setdefault(str(folder), {"registered": now()})
+    v.size = entry.get("size")
+    deny = deny_reason(folder, cfg)
+    if deny:
+        v.reason = f"refused: {deny}"
+        return v
+    try:
+        v.ttl_s = m.ttl_seconds
+    except ValueError as e:
+        v.reason = f"bad marker: {e}"
+        return v
+    start = m.mtime
+    if m.holds:
+        v.reason = "held by " + ", ".join(str(h.get("job")) for h in m.holds)
+        return v
+    closed_at = None
+    if m.job:
+        closed, closed_at, detail = job_closed(m.job, cfg, reg)
+        if not closed:
+            v.reason = f"job {m.job} {detail if closed is False else 'state unknown: ' + detail}"
+            return v
+        start = max(start, closed_at or 0)
+    if m.session:
+        reason = session_problem(m, cfg, entry, closed_at)
+        if reason:
+            v.reason = reason
+            return v
+        start = max(start, entry["session_exit_seen"])
+    v.clock_start = start
+    v.expired = now() - start >= v.ttl_s
+    if not deep:
+        v.safe = True
+        v.reason = (
+            "expired (shallow)"
+            if v.expired
+            else f"fresh, expires in {human_age(start + v.ttl_s - now())}"
+        )
+        return v
+    w = walk(folder, cfg, check_names=True)
+    if w.size is not None:
+        v.size = w.size
+        entry.update(size=w.size, size_at=now())
+    reason, repo = tree_problem(folder, m, cfg, w)
+    v.repo = repo
+    if reason:
+        v.reason = reason
+        return v
+    hold = holder_hold(m, cfg)
+    if hold:
+        v.reason = f"held: {hold}"
+        return v
+    busy = open_files(folder)
+    if busy:
+        v.reason = busy
+        return v
+    v.safe = True
+    v.reason = (
+        f"expired ({human_age(now() - start)} > {m.ttl or DEFAULT_TTL[m.effective_kind]})"
+        if v.expired
+        else f"safe, expires in {human_age(start + v.ttl_s - now())}"
+    )
+    dest = m.move_to or (cfg.move_root if m.effective_kind != "cache" else None)
+    v.action, v.dest = ("move", dest) if dest else ("delete", None)
+    return v
+
+
+# --- removal -----------------------------------------------------------------------------
+
+
+def file_hashes(root: Path) -> dict[str, str]:
+    out = {}
+    for d, dirs, files in os.walk(root):
+        for name in files + [x for x in dirs if (Path(d) / x).is_symlink()]:
+            if name == ".DS_Store":
+                continue
+            p = Path(d) / name
+            rel = str(p.relative_to(root))
+            if p.is_symlink():
+                out[rel] = "link:" + os.readlink(p)
+                continue
+            h = hashlib.sha256()
+            with p.open("rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            out[rel] = h.hexdigest()
+    return out
+
+
+def remote_run(
+    cfg_cmd: list[str], host: str, script: str, **kw
+) -> subprocess.CompletedProcess:
+    cmd = [a.replace("{host}", host).replace("{script}", script) for a in cfg_cmd]
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, **kw)
+
+
+def remote_hashes(host: str, path: str, cfg_cmd: list[str]) -> dict[str, str] | None:
+    script = (
+        f"cd {shlex_quote(path)} && find . -type f ! -name .DS_Store -print0 | xargs -0 shasum -a 256; "
+        f'find . -type l -print0 | while IFS= read -r -d \'\' l; do printf \'link:%s  %s\\n\' "$(readlink "$l")" "$l"; done'
+    )
+    res = remote_run(cfg_cmd, host, script, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    out = {}
+    for line in res.stdout.splitlines():
+        digest, _, rel = line.partition("  ")
+        out[rel[2:] if rel.startswith("./") else rel] = digest
+    return out
+
+
+def shlex_quote(s: str) -> str:
+    return shlex.quote(s)
+
+
+def move_destination(dest_root: str, folder: Path) -> tuple[str | None, str]:
+    host, sep, root = dest_root.partition(":")
+    if not sep or "/" in host:
+        host, root = None, dest_root
+    rel = f"{hostname()}{folder}"
+    return host, str(
+        Path(root).expanduser() / rel
+    ) if not host else f"{root.rstrip('/')}/{rel}"
+
+
+def move_and_verify(
+    folder: Path,
+    dest_root: str,
+    remote_cmd: list[str] | None = None,
+    src: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    remote_cmd = remote_cmd or DEFAULT_REMOTE_COMMAND
+    host, dest = move_destination(dest_root, folder)
+    if src is None:
+        src = file_hashes(folder)
+    src = {k: v for k, v in src.items() if k != MARKER}
+    if host:
+        mk = remote_run(
+            remote_cmd, host, f"mkdir -p {shlex_quote(dest)}", capture_output=True
+        )
+        if mk.returncode != 0:
+            return False, f"mkdir on {host} failed"
+        r = subprocess.run(
+            ["rsync", "-a", "--exclude", ".DS_Store", f"{folder}/", f"{host}:{dest}/"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        if r.returncode != 0:
+            return False, f"rsync failed: {r.stderr.strip()[:120]}"
+        got = remote_hashes(host, dest, remote_cmd)
+        if got is None:
+            return False, "remote hash failed"
+    else:
+        d = Path(dest)
+        if d.exists():
+            return False, f"destination exists: {d}"
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            folder, d, symlinks=True, ignore=shutil.ignore_patterns(".DS_Store")
+        )
+        got = file_hashes(d)
+    got.pop(MARKER, None)
+    if got != src:
+        missing = sorted(set(src) - set(got))[:3]
+        changed = sorted(k for k in set(src) & set(got) if src[k] != got[k])[:3]
+        return (
+            False,
+            f"hash mismatch at {host + ':' if host else ''}{dest} (missing {missing}, changed {changed})",
+        )
+    return True, f"{host + ':' if host else ''}{dest}"
+
+
+def rmtree_same_dev(path: Path) -> list[Path]:
+    """Delete `path` without crossing into other filesystems. Returns the directories
+    left behind because they are mount points (or could not be removed)."""
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"refusing to remove {path}: not a real directory")
+    dev = st.st_dev
+    left: list[Path] = []
+
+    def clear(d: Path) -> bool:
+        ok = True
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            left.append(d)
+            return False
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+                if e.is_dir(follow_symlinks=False):
+                    if st.st_dev != dev:
+                        left.append(Path(e.path))
+                        ok = False
+                    elif clear(Path(e.path)):
+                        os.rmdir(e.path)
+                    else:
+                        ok = False
+                else:
+                    os.unlink(e.path)
+            except OSError:
+                left.append(Path(e.path))
+                ok = False
+        return ok
+
+    if clear(path):
+        os.rmdir(path)
+    return left
+
+
+def entry_for(folder: Path, reg: dict) -> dict:
+    return reg["markers"].setdefault(str(folder), {"registered": now()})
+
+
+def remove_folder(
+    v: Verdict, armed: bool, cfg: Config, reg: dict, floor_pressure: bool = False
+) -> tuple[bool, str]:
+    """Final re-checks, then move/delete. Returns (done, detail).
+
+    Everything that could have changed since evaluation is re-checked under the
+    marker lock (the same lock `hold` takes) immediately before the source is
+    renamed away, including after a long verified copy. Unless the folder was
+    chosen for free-space pressure (`floor_pressure`), its TTL/grace clock is
+    recomputed from the fresh marker mtime, job close time and session state and
+    it must still be expired."""
+    m = v.marker
+    assert m is not None
+    if not armed:
+        return False, "dry-run"
+    if os.path.ismount(v.folder):
+        return False, "folder is a mount point"
+    try:
+        ident = v.folder.lstat()
+    except OSError as e:
+        return False, f"folder unreadable: {e.strerror}"
+
+    def recheck(src_hashes: dict[str, str] | None = None) -> str | None:
+        try:
+            fresh = read_marker(v.folder)
+        except (OSError, ValueError) as e:
+            return f"marker changed: {e}"
+        if fresh.mtime != m.mtime or fresh.holds:
+            return "marker touched or held since evaluation"
+        if deny_reason(v.folder, cfg):
+            return "refused by deny-list"
+        try:
+            now_stat = v.folder.lstat()
+        except OSError as e:
+            return f"folder unreadable: {e.strerror}"
+        if (now_stat.st_dev, now_stat.st_ino) != (ident.st_dev, ident.st_ino):
+            return "folder replaced since evaluation"
+        hold = holder_hold(fresh, cfg)
+        if hold:
+            return f"held: {hold}"
+        busy = open_files(v.folder)
+        if busy:
+            return busy
+        # Job state may have changed (reopened, keep/hold label, helper failing):
+        # ask again, bypassing the cache.
+        closed_at = None
+        if fresh.job:
+            closed, closed_at, detail = job_closed(fresh.job, cfg, reg, fresh=True)
+            if not closed:
+                return f"job {fresh.job} {detail if closed is False else 'state unknown: ' + detail}"
+        if fresh.session:
+            entry = entry_for(v.folder, reg)
+            reason = session_problem(fresh, cfg, entry, closed_at)
+            if reason:
+                return reason
+        if not floor_pressure:
+            start = fresh.mtime
+            if fresh.job:
+                start = max(start, closed_at or 0)
+            if fresh.session:
+                start = max(start, entry_for(v.folder, reg).get("session_exit_seen", 0))
+            try:
+                ttl_s = fresh.ttl_seconds
+            except ValueError as e:
+                return f"bad marker: {e}"
+            if now() - start < ttl_s:
+                return (
+                    f"no longer expired (clock restarted {human_age(now() - start)} ago, "
+                    f"ttl {human_age(ttl_s)})"
+                )
+        # Repeat the worktree checks: work may have been added since evaluation
+        # (or during a long copy) that the original verdict never saw.
+        w = walk(v.folder, cfg, check_names=True)
+        reason, repo = tree_problem(v.folder, fresh, cfg, w)
+        if reason:
+            return reason
+        if repo != v.repo:
+            return "repository type changed since evaluation"
+        if src_hashes is not None:
+            current = file_hashes(v.folder)
+            current.pop(MARKER, None)
+            if current != src_hashes:
+                return "source changed while it was being copied"
+        return None
+
+    with hold_lock():
+        problem = recheck()
+    if problem:
+        return False, problem
+    dest_detail = ""
+    src_hashes = None
+    if v.action == "move":
+        src_hashes = file_hashes(v.folder)
+        src_hashes.pop(MARKER, None)
+        ok, detail = move_and_verify(
+            v.folder, v.dest, cfg.remote_command, src=src_hashes
+        )
+        if not ok:
+            return False, f"kept source: {detail}"
+        dest_detail = f" -> {detail}"
+    with hold_lock():
+        # A hold, lease, reader or write may have appeared during the copy.
+        problem = recheck(src_hashes)
+        if problem:
+            return False, f"kept source{dest_detail}: {problem}"
+        common = None
+        if v.repo == "git-linked":
+            res = run(
+                ["git", "-C", str(v.folder), "rev-parse", "--git-common-dir"],
+                timeout=30,
+            )
+            if res.returncode == 0:
+                common = (v.folder / res.stdout.strip()).resolve()
+        if v.repo == "jj-secondary":
+            res = run(
+                [
+                    "jj",
+                    "-R",
+                    str(v.folder),
+                    "--ignore-working-copy",
+                    "workspace",
+                    "forget",
+                ],
+                timeout=60,
+            )
+            if res.returncode != 0:
+                return False, f"jj workspace forget failed: {res.stderr.strip()[:100]}"
+        trash = v.folder.with_name(f".{v.folder.name}.reclaimable-trash-{int(now())}")
+        os.rename(v.folder, trash)
+        if trash.is_symlink() or not trash.is_dir():
+            # Swapped for a symlink after the check: put it back untouched.
+            os.rename(trash, v.folder)
+            return False, "folder became a symlink; restored, nothing deleted"
+    left = rmtree_same_dev(trash)
+    if common:
+        run(["git", "--git-dir", str(common), "worktree", "prune"], timeout=60)
+    reg["markers"].pop(str(v.folder), None)
+    if left:
+        dest_detail += f" (left {trash} holding {len(left)} other-filesystem dirs)"
+    return True, dest_detail
+
+
+# --- sweep -------------------------------------------------------------------------------
+
+
+def free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def armed_state() -> tuple[bool, str]:
+    if not ARMED_FILE.exists():
+        return False, "unarmed"
+    try:
+        at = float(json.loads(ARMED_FILE.read_text())["armed_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False, f"unreadable {ARMED_FILE}"
+    if now() - at < ARM_GRACE_S:
+        return False, f"armed {human_age(now() - at)} ago; dry-run until 24h"
+    return (
+        True,
+        f"armed since {time.strftime('%Y-%m-%d', time.localtime(at))} {clock(at)}",
+    )
+
+
+def volume_limits(folder: Path, cfg: Config) -> tuple[int, int] | None:
+    """(floor, target) for the volume holding `folder`, or None when it has no floor."""
+    try:
+        dev = folder.stat().st_dev
+        home_dev = HOME.stat().st_dev
+    except OSError:
+        return None
+    mount = folder
+    while not os.path.ismount(mount) and mount != mount.parent:
+        mount = mount.parent
+    floor = cfg.volume_floors.get(str(expand(mount)), cfg.floor if dev == home_dev else None)
+    if floor is None:
+        return None
+    return floor, (cfg.target if dev == home_dev else floor + TARGET_MARGIN)
+
+
+def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
+    """Expired + safe always; then, per volume under its floor, safe ones LRU-first until target."""
+    chosen = [(v, "ttl expired") for v in verdicts if v.safe and v.expired]
+    picked = {id(v) for v, _ in chosen}
+    home_dev = HOME.stat().st_dev
+    by_dev: dict[int, list[Verdict]] = {}
+    for v in verdicts:
+        with contextlib.suppress(OSError):
+            by_dev.setdefault(v.folder.stat().st_dev, []).append(v)
+    for dev, group in by_dev.items():
+        mount = group[0].folder
+        while not os.path.ismount(mount) and mount != mount.parent:
+            mount = mount.parent
+        floor = cfg.volume_floors.get(
+            str(expand(mount)), cfg.floor if dev == home_dev else None
+        )
+        if floor is None:
+            continue
+        target = cfg.target if dev == home_dev else floor + TARGET_MARGIN
+        free = free_bytes(group[0].folder)
+        free += sum(v.size or 0 for v, _ in chosen if v.folder.stat().st_dev == dev)
+        if free >= floor:
+            continue
+        for v in sorted(group, key=lambda x: x.last_used):
+            if free >= target:
+                break
+            if v.safe and id(v) not in picked and v.size:
+                chosen.append(
+                    (
+                        v,
+                        f"low space ({human_bytes(free)} free < floor {human_bytes(floor)}), LRU",
+                    )
+                )
+                picked.add(id(v))
+                free += v.size
+    return chosen
+
+
+def sweep(args, cfg: Config) -> int:
+    if args.floor is not None:
+        cfg.floor = args.floor
+        cfg.target = max(cfg.target, cfg.floor)
+    if args.target is not None:
+        cfg.target = max(args.target, cfg.floor)
+    if args.dry_run:
+        armed, mode = False, "dry-run (forced)"
+    elif args.armed:
+        armed = ARMED_FILE.exists()
+        mode = (
+            "armed (manual)"
+            if armed
+            else "dry-run: --armed needs `reclaimable arm` first"
+        )
+    else:
+        armed, mode = armed_state()
+        mode = mode if armed else f"dry-run ({mode})"
+    with state_lock():
+        reg = load_registry()
+        folders = discover(cfg, reg, force_scan=args.scan)
+        verdicts = [evaluate(f, cfg, reg) for f in folders]
+        actions = plan(verdicts, cfg)
+        done = []
+        acted = set()
+        freed_on: dict[int, int] = {}  # estimated bytes removed per device this sweep
+        start_free: dict[int, int] = {}
+        for v, why in actions:
+            acted.add(id(v))
+            m = v.marker
+            verb = "move" if v.action == "move" else "delete"
+            pressure = why.startswith("low space")
+            dev = None
+            if armed and pressure:
+                # Pressure removals stop once real free space (and the sizes freed so
+                # far) reach the target; the plan was only an estimate.
+                lim = volume_limits(v.folder, cfg)
+                with contextlib.suppress(OSError):
+                    dev = v.folder.stat().st_dev
+                if lim and dev is not None:
+                    start_free.setdefault(dev, free_bytes(v.folder))
+                    real = free_bytes(v.folder)
+                    estimated = start_free[dev] + freed_on.get(dev, 0)
+                    if max(real, 0) >= lim[1] or estimated >= lim[1]:
+                        line = (
+                            f"skip {v.folder}: free space target reached "
+                            f"({human_bytes(real)} free >= {human_bytes(lim[1])})"
+                        )
+                        log(line)
+                        say(line)
+                        done.append({**v.row(), "why": why, "done": False, "detail": "target reached"})
+                        continue
+            ok, detail = remove_folder(
+                v, armed, cfg, reg, floor_pressure=pressure
+            )
+            if ok and dev is not None:
+                freed_on[dev] = freed_on.get(dev, 0) + (v.size or 0)
+            line = (
+                f"{'' if armed else '[dry-run] '}{verb if ok else ('would ' + verb if not armed else verb + ' SKIPPED')} "
+                f"{v.folder} ({human_bytes(v.size)}) owner={m.owner} kind={m.effective_kind} reason={why}"
+                f"{detail if ok else ('' if detail == 'dry-run' else ': ' + detail)}"
+            )
+            log(line)
+            say(line)
+            done.append({**v.row(), "why": why, "done": ok, "detail": detail})
+        write_export_list(reg, cfg)
+        save_registry(reg)
+        summary = {
+            "at": now(),
+            "host": hostname(),
+            "mode": mode,
+            "armed": armed,
+            "markers": len(verdicts),
+            "free": free_bytes(HOME),
+            "floor": cfg.floor,
+            "target": cfg.target,
+            "actions": done,
+            "blocked": [v.row() for v in verdicts if not v.safe],
+            "kept": [v.row() for v in verdicts if id(v) not in acted],
+            "scan_complete": reg.get("last_scan_complete"),
+        }
+        write_json(LAST_SWEEP, summary)
+    freed = sum(a["size"] or 0 for a in done if a["done"])
+    would = sum(a["size"] or 0 for a in done)
+    tail = (
+        f"sweep {mode}: {len(verdicts)} markers, {len(done)} actions, "
+        f"{'freed ' + human_bytes(freed) if armed else 'would free ' + human_bytes(would)}, "
+        f"{len(summary['kept'])} kept, free {human_bytes(summary['free'])} (floor {human_bytes(cfg.floor)})"
+    )
+    log(tail)
+    say(tail)
+    if args.verbose:
+        for v in verdicts:
+            if id(v) not in acted:
+                say(f"  keep {v.folder}: {v.reason}")
+    return 0
+
+
+# --- commands -------------------------------------------------------------------------------
+
+
+def resolve_folder(raw: str) -> Path:
+    p = expand(raw)
+    if p.name == MARKER:
+        p = p.parent
+    return p
+
+
+def cmd_mark(args, cfg: Config) -> int:
+    folder = resolve_folder(args.path)
+    deny = deny_reason(folder, cfg)
+    if deny:
+        print(
+            f"reclaimable: refusing to mark {folder}: {deny}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    if args.ttl:
+        parse_ttl(args.ttl)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        m = read_marker(folder)
+    except FileNotFoundError:
+        m = Marker(folder=folder, owner=args.owner)
+    except ValueError as e:
+        print(
+            f"reclaimable: replacing invalid marker ({e})", file=sys.stderr, flush=True
+        )
+        m = Marker(folder=folder, owner=args.owner)
+    m.owner = args.owner
+    for key in ("ttl", "kind", "job", "session", "move_to"):
+        value = getattr(args, key)
+        if value is not None:
+            setattr(m, key, value or None)
+    if args.regen is not None:
+        m.regenerate = args.regen
+    if not m.regenerate:
+        print(
+            "reclaimable: --regen is required for a new marker",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    write_marker(m)
+    register(folder)
+    say(
+        f"marked {folder} owner={m.owner} kind={m.effective_kind} ttl={m.ttl or DEFAULT_TTL[m.effective_kind]}"
+    )
+    return 0
+
+
+def cmd_touch(args, cfg: Config) -> int:
+    rc = 0
+    for raw in args.paths:
+        marker = resolve_folder(raw) / MARKER
+        if not marker.is_file():
+            print(
+                f"reclaimable: no marker in {marker.parent}",
+                file=sys.stderr,
+                flush=True,
+            )
+            rc = 1
+            continue
+        os.utime(marker)
+    return rc
+
+
+def cmd_hold(args, cfg: Config, release: bool = False) -> int:
+    folder = resolve_folder(args.path)
+    with hold_lock():
+        try:
+            m = read_marker(folder)
+        except (OSError, ValueError) as e:
+            print(f"reclaimable: {folder}: {e}", file=sys.stderr, flush=True)
+            return 1
+        sub = expand(args.subpath) if args.subpath else None
+        if release:
+            before = len(m.holds)
+            m.holds = [
+                h
+                for h in m.holds
+                if not (
+                    h.get("job") == args.job
+                    and (sub is None or h.get("path") == str(sub))
+                )
+            ]
+            if len(m.holds) == before:
+                print(
+                    f"reclaimable: {args.job} holds nothing in {folder}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 1
+        else:
+            hold = {"job": args.job, "at": now()}
+            if sub:
+                hold["path"] = str(sub)
+            m.holds = [
+                h
+                for h in m.holds
+                if not (h.get("job") == args.job and h.get("path") == hold.get("path"))
+            ]
+            m.holds.append(hold)
+        write_marker(m)
+    say(
+        f"{'released' if release else 'held'} {folder} for {args.job} ({len(m.holds)} holds)"
+    )
+    return 0
+
+
+def cmd_ls(args, cfg: Config) -> int:
+    roots = [expand(r) for r in args.roots] or None
+    with state_lock():
+        reg = load_registry()
+        folders = discover(cfg, reg, force_scan=args.scan, roots=roots)
+        verdicts = [evaluate(f, cfg, reg, deep=not args.quick) for f in folders]
+        save_registry(reg)
+        write_export_list(reg, cfg)
+    rows = [v.row() for v in verdicts]
+    if args.json:
+        print(json.dumps(rows, indent=2), flush=True)
+        return 0
+    if not rows:
+        say("no .reclaimable markers")
+        return 0
+    for r in sorted(rows, key=lambda r: r["last_used"] or 0):
+        state = (
+            "ELIGIBLE"
+            if r["safe"] and r["expired"]
+            else ("safe" if r["safe"] else "kept")
+        )
+        path = str(r["path"]).replace(str(HOME), "~", 1)
+        say(
+            f"{state:8} {human_bytes(r['size']):>9}  {human_age(r['age_s'] or 0):>6} / {r['ttl'] or '?':<4} "
+            f"{(r['owner'] or '?')[:14]:<14} {(r['kind'] or '?'):<8} {path}  ({r['reason']})"
+        )
+    return 0
+
+
+def cmd_status(args, cfg: Config) -> int:
+    armed, mode = armed_state()
+    last = load_json(LAST_SWEEP, None)
+    say(
+        f"host {hostname()}  {mode}  free {human_bytes(free_bytes(HOME))}  floor {human_bytes(cfg.floor)}  target {human_bytes(cfg.target)}"
+    )
+    reg = load_json(REGISTRY, {"markers": {}})
+    say(
+        f"registered markers: {len(reg.get('markers', {}))}  last scan: "
+        f"{human_age(now() - reg['last_scan']) + ' ago' if reg.get('last_scan') else 'never'}"
+        f"{'' if reg.get('last_scan_complete', True) else ' (depth/time-limited; marked folders are always registered)'}"
+    )
+    if last:
+        say(
+            f"last sweep {human_age(now() - last['at'])} ago ({last['mode']}): {last['markers']} markers, "
+            f"{len(last['actions'])} actions, {len(last.get('kept', last['blocked']))} kept"
+        )
+    else:
+        say("no sweep yet")
+    if LOG_FILE.exists():
+        say(f"--- {str(LOG_FILE).replace(str(HOME), '~')} (last {args.lines})")
+        for line in LOG_FILE.read_text().splitlines()[-args.lines :]:
+            say(line)
+    return 0
+
+
+def cmd_arm(args, cfg: Config) -> int:
+    if args.off:
+        ARMED_FILE.unlink(missing_ok=True)
+        log("disarmed")
+        say("disarmed: sweeps are dry-run")
+        return 0
+    if ARMED_FILE.exists():
+        say(armed_state()[1])
+        return 0
+    write_json(ARMED_FILE, {"armed_at": now(), "host": hostname()})
+    log("armed (first 24h stay dry-run)")
+    say("armed; scheduled sweeps stay dry-run for the first 24h")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="reclaimable",
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Config: ~/.config/reclaimable/config.toml (see README)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("mark", help="create/update a folder's .reclaimable marker")
+    s.add_argument("path")
+    s.add_argument(
+        "-o", "--owner", required=True, help="tool or job that owns the folder"
+    )
+    s.add_argument(
+        "-t",
+        "--ttl",
+        help="e.g. 24h, 3d (default by kind: "
+        + ", ".join(f"{k} {v}" for k, v in DEFAULT_TTL.items())
+        + ")",
+    )
+    s.add_argument("-r", "--regen", help="one line: how the folder comes back")
+    s.add_argument("-k", "--kind", choices=KINDS)
+    s.add_argument("-j", "--job", help="job issue number (#N) for job-tied data")
+    s.add_argument(
+        "-s",
+        "--session",
+        help="id of the session that owns the data (a pid, or text matched against the process list)",
+    )
+    s.add_argument(
+        "-m",
+        "--move-to",
+        dest="move_to",
+        help="move here (path or host:path) instead of deleting",
+    )
+
+    s = sub.add_parser("touch", help="mark folders used now")
+    s.add_argument("paths", nargs="+")
+
+    for name, text in (
+        ("hold", "declare a job is reading the folder (never removed while held)"),
+        ("release", "drop a job's hold"),
+    ):
+        s = sub.add_parser(name, help=text)
+        s.add_argument("path")
+        s.add_argument("job")
+        s.add_argument(
+            "-p", "--path", dest="subpath", help="specific path inside the folder"
+        )
+
+    s = sub.add_parser("ls", help="list markers with age, size, TTL and eligibility")
+    s.add_argument("roots", nargs="*")
+    s.add_argument("-j", "--json", action="store_true")
+    s.add_argument(
+        "-q",
+        "--quick",
+        action="store_true",
+        help="skip size/lsof/lease/worktree checks",
+    )
+    s.add_argument(
+        "-S", "--scan", action="store_true", help="rescan roots for markers first"
+    )
+
+    s = sub.add_parser("sweep", help="the janitor (dry-run unless this host is armed)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("-n", "--dry-run", action="store_true", help="never remove anything")
+    g.add_argument(
+        "-A",
+        "--armed",
+        action="store_true",
+        help="act now (host must be armed; skips the 24h wait)",
+    )
+    s.add_argument(
+        "-f",
+        "--floor",
+        type=parse_size,
+        help="free-space floor (default: config, else 30GB)",
+    )
+    s.add_argument(
+        "-t",
+        "--target",
+        type=parse_size,
+        help="free space to reach once under the floor",
+    )
+    s.add_argument(
+        "-S", "--scan", action="store_true", help="full marker rescan (otherwise daily)"
+    )
+    s.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="also list kept markers with reasons",
+    )
+
+    s = sub.add_parser("status", help="armed state, free space, last sweep, log tail")
+    s.add_argument("-l", "--lines", type=int, default=15)
+
+    s = sub.add_parser("arm", help="arm this host (scheduled sweeps act after 24h)")
+    s.add_argument("-x", "--off", action="store_true", help="disarm")
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = load_config()
+    try:
+        if args.cmd == "mark":
+            return cmd_mark(args, cfg)
+        if args.cmd == "touch":
+            return cmd_touch(args, cfg)
+        if args.cmd in ("hold", "release"):
+            return cmd_hold(args, cfg, release=args.cmd == "release")
+        if args.cmd == "ls":
+            return cmd_ls(args, cfg)
+        if args.cmd == "sweep":
+            return sweep(args, cfg)
+        if args.cmd == "status":
+            return cmd_status(args, cfg)
+        if args.cmd == "arm":
+            return cmd_arm(args, cfg)
+    except ValueError as e:
+        print(f"reclaimable: {e}", file=sys.stderr, flush=True)
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
