@@ -769,7 +769,28 @@ func (a *App) discover(cfg *Config, reg map[string]any, force bool, roots []stri
 	}
 	out := []string{}
 	markers := mapEntry(reg, "markers")
-	for f := range markers {
+	seen := map[string]bool{}
+	for _, original := range sortedKeys(markers) {
+		f := original
+		if !filepath.IsAbs(f) {
+			if err := a.log("ignoring relative registry path " + pyRepr(f)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		normalized := a.expand(f)
+		if normalized != f {
+			value := markers[f]
+			delete(markers, f)
+			if _, ok := markers[normalized]; !ok {
+				markers[normalized] = value
+			}
+			f = normalized
+		}
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
 		if !isFile(filepath.Join(f, markerName)) {
 			delete(markers, f)
 			continue

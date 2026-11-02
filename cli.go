@@ -356,7 +356,10 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
 	}
 	for _, dev := range devs {
 		group := byDev[dev]
-		mount := group[0].Folder
+		mount, e := filepath.Abs(group[0].Folder)
+		if e != nil {
+			return nil, e
+		}
 		for !isMount(mount) && filepath.Dir(mount) != mount {
 			mount = filepath.Dir(mount)
 		}

@@ -188,13 +188,18 @@ func runCommand(argv []string, timeout float64, cwd string, env []string) Result
 }
 func (a *App) expand(p string) string {
 	if p == "~" {
-		return a.Home
-	}
-	if strings.HasPrefix(p, "~/") {
+		p = a.Home
+	} else if strings.HasPrefix(p, "~/") {
 		p = filepath.Join(a.Home, p[2:])
 	}
-	return filepath.Clean(p)
+	p = filepath.Clean(p)
+	absolute, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return absolute
 }
+
 func (a *App) resolveFolder(p string) string {
 	p = a.expand(p)
 	if filepath.Base(p) == markerName {
@@ -346,7 +351,14 @@ func markerEntry(reg map[string]any, folder string, now float64) map[string]any 
 	}
 	return e
 }
-func related(a, b string) bool { return within(a, b) || within(b, a) }
+func related(a, b string) bool {
+	aa, ea := filepath.Abs(a)
+	bb, eb := filepath.Abs(b)
+	if ea != nil || eb != nil {
+		return true
+	}
+	return within(aa, bb) || within(bb, aa)
+}
 func within(p, root string) bool {
 	r, e := filepath.Rel(root, p)
 	return e == nil && (r == "." || r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)))
@@ -373,6 +385,11 @@ func isFile(p string) bool { s, e := os.Stat(p); return e == nil && s.Mode().IsR
 func exists(p string) bool { _, e := os.Stat(p); return e == nil }
 func isDir(p string) bool  { s, e := os.Stat(p); return e == nil && s.IsDir() }
 func isMount(p string) bool {
+	absolute, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+	p = absolute
 	s, e := os.Stat(p)
 	if e != nil {
 		return false

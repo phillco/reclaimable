@@ -413,12 +413,22 @@ func parseClosedAt(s string) *float64 {
 	return &n
 }
 func (a *App) jobClosed(job string, cfg *Config, reg map[string]any) (*bool, *float64, string) {
+	return a.jobClosedChecked(job, cfg, reg, true)
+}
+
+// Final removal checks must observe the scheduler again even when evaluation
+// recently cached a positive close result.
+func (a *App) jobClosedFresh(job string, cfg *Config, reg map[string]any) (*bool, *float64, string) {
+	return a.jobClosedChecked(job, cfg, reg, false)
+}
+
+func (a *App) jobClosedChecked(job string, cfg *Config, reg map[string]any, useCache bool) (*bool, *float64, string) {
 	if len(cfg.JobDone) == 0 {
 		return nil, nil, "no job_done command configured"
 	}
 	cache := mapEntry(reg, "jobs")
 	hit := dict(cache[job])
-	if truth(hit["closed"]) && a.Now()-number(hit["checked"]) < 3600 {
+	if useCache && truth(hit["closed"]) && a.Now()-number(hit["checked"]) < 3600 {
 		closed := true
 		var at *float64
 		if hit["closed_at"] != nil {
@@ -430,16 +440,20 @@ func (a *App) jobClosed(job string, cfg *Config, reg map[string]any) (*bool, *fl
 	firstSeen := number(hit["first_closed_seen"])
 	cmd, ok := a.filledCommand(cfg.JobDone["command"], map[string]string{"job": job})
 	if !ok {
+		delete(cache, job)
 		return nil, nil, "job_done failed to run (invalid command)"
 	}
 	r := a.Run(cmd, timeoutValue(cfg.JobDone, 30), "", withEnv(map[string]string{"job": job}))
 	if r.Timeout {
+		delete(cache, job)
 		return nil, nil, "job_done timed out"
 	}
 	if r.Err != nil {
+		delete(cache, job)
 		return nil, nil, fmt.Sprintf("job_done failed to run (%s)", r.Err)
 	}
 	if r.Code != 0 && r.Code != 1 {
+		delete(cache, job)
 		return nil, nil, fmt.Sprintf("job_done exited %d", r.Code)
 	}
 	closed := r.Code == 0
@@ -615,13 +629,21 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 			p := filepath.Join(d, e.Name())
 			st, err := a.Lstat(p)
 			if err != nil {
-				continue
+				w.Problem = fmt.Sprintf("unreadable %s: %s", p, err)
+				w.Repos = sortedKeys(repos)
+				return w
 			}
 			size += allocated(st)
 			w.Files++
 			rel, _ := filepath.Rel(folder, p)
+			absolute, err := filepath.Abs(p)
+			if err != nil {
+				w.Problem = "unreadable " + p + ": " + err.Error()
+				w.Repos = sortedKeys(repos)
+				return w
+			}
 			for _, pattern := range patterns {
-				if globMatch(p, pattern) {
+				if globMatch(p, pattern) || globMatch(absolute, pattern) {
 					w.Problem = "contains deny-listed " + rel
 					w.Repos = sortedKeys(repos)
 					return w
@@ -648,6 +670,44 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 	w.Repos = sortedKeys(repos)
 	return w
 }
+
+// sessionProblem is shared by evaluation and both final removal boundaries.
+// Every non-conclusive probe clears the recorded exit observation.
+func (a *App) sessionProblem(m *Marker, cfg *Config, entry map[string]any, closedAt *float64) string {
+	if m.Session == "" {
+		return ""
+	}
+	label := shortText(m.Session, 12)
+	running := a.SessionRunning(m.Session)
+	if running == "no-match" && cfg.SessionGrace != nil && m.Job != "" && !digitsPattern.MatchString(m.Session) {
+		if closedAt == nil || *closedAt == 0 {
+			delete(entry, "session_exit_seen")
+			return "session " + label + " unknown and job close time unavailable"
+		}
+		ready := *closedAt + *cfg.SessionGrace
+		if a.Now() < ready {
+			delete(entry, "session_exit_seen")
+			return "session " + label + " within grace (job closed " + humanAge(a.Now()-*closedAt) + " ago, grace " + humanAge(*cfg.SessionGrace) + ")"
+		}
+		running = "gone"
+		if _, ok := entry["session_exit_seen"]; !ok {
+			entry["session_exit_seen"] = ready
+		}
+	}
+	if running == "unknown" || running == "no-match" || running == "" {
+		delete(entry, "session_exit_seen")
+		return "session " + label + " state unknown"
+	}
+	if running == "alive" {
+		delete(entry, "session_exit_seen")
+		return "session " + label + " still running"
+	}
+	if _, ok := entry["session_exit_seen"]; !ok {
+		entry["session_exit_seen"] = a.Now()
+	}
+	return ""
+}
+
 func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string, string) {
 	if w.Problem != "" {
 		return w.Problem, ""
@@ -685,6 +745,7 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 	return "", repo
 }
 func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool) *Verdict {
+	folder = a.expand(folder)
 	v := &Verdict{Folder: folder, Action: "keep"}
 	m, err := a.readMarker(folder)
 	if err != nil {
@@ -735,40 +796,13 @@ func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool
 		}
 	}
 	if m.Session != "" {
-		running := a.SessionRunning(m.Session)
-		id := shortText(m.Session, 12)
-		if running == "no-match" && cfg.SessionGrace != nil && m.Job != "" && !digitsPattern.MatchString(m.Session) {
-			if closedAt == nil || *closedAt == 0 {
-				v.Reason = "session " + id + " unknown and job close time unavailable"
-				delete(entry, "session_exit_seen")
-				return v
-			}
-			ready := *closedAt + *cfg.SessionGrace
-			if a.Now() < ready {
-				v.Reason = "session " + id + " within grace (job closed " + humanAge(a.Now()-*closedAt) + " ago, grace " + humanAge(*cfg.SessionGrace) + ")"
-				delete(entry, "session_exit_seen")
-				return v
-			}
-			running = "gone"
-			if _, ok := entry["session_exit_seen"]; !ok {
-				entry["session_exit_seen"] = ready
-			}
-		}
-		if running == "unknown" || running == "no-match" || running == "" {
-			v.Reason = "session " + id + " state unknown"
-			delete(entry, "session_exit_seen")
+		if reason := a.sessionProblem(m, cfg, entry, closedAt); reason != "" {
+			v.Reason = reason
 			return v
-		}
-		if running == "alive" {
-			v.Reason = "session " + id + " still running"
-			delete(entry, "session_exit_seen")
-			return v
-		}
-		if _, ok := entry["session_exit_seen"]; !ok {
-			entry["session_exit_seen"] = a.Now()
 		}
 		start = max(start, number(entry["session_exit_seen"]))
 	}
+
 	v.ClockStart = start
 	v.Expired = a.Now()-start >= v.TTLS
 	if !deep {

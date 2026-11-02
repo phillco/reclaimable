@@ -433,6 +433,30 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 		if busy := a.OpenFiles(v.Folder); busy != "" {
 			return busy
 		}
+		var closedAt *float64
+		if fresh.Job != "" {
+			closed, at, detail := a.jobClosedFresh(fresh.Job, cfg, reg)
+			closedAt = at
+			if closed == nil || !*closed {
+				if closed == nil {
+					detail = "state unknown: " + detail
+				}
+				return "job " + fresh.Job + " " + detail
+			}
+		}
+		if reason := a.sessionProblem(fresh, cfg, markerEntry(reg, v.Folder, a.Now()), closedAt); reason != "" {
+			return reason
+		}
+		start := fresh.Mtime
+		if closedAt != nil {
+			start = max(start, *closedAt)
+		}
+		if fresh.Session != "" {
+			start = max(start, number(markerEntry(reg, v.Folder, a.Now())["session_exit_seen"]))
+		}
+		if v.Expired && a.Now()-start < v.TTLS {
+			return "job/session clock changed since evaluation; TTL not expired"
+		}
 		w := a.walk(v.Folder, cfg, true, 300)
 		reason, repo := a.treeProblem(v.Folder, fresh, cfg, w)
 		if reason != "" {
