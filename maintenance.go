@@ -272,10 +272,16 @@ func (a *App) maintenanceInUse(h Maintenance) string {
 		if err != nil {
 			return err.Error()
 		}
-		if err := maintenanceExecutableName(expandConfigDir(cmd[0], a.ConfigFile)); err != nil {
+		executable := expandConfigDir(cmd[0], a.ConfigFile)
+		if err := maintenanceExecutableName(executable); err != nil {
 			return err.Error()
 		}
-		if reason := a.commandHoldWithRunner(holder, &Marker{Folder: a.Home, Owner: h.Name, Kind: "cache"}, a.runMaintenanceProbe); reason != "" {
+		// Placeholders fill arguments only: the validated executable is what runs,
+		// so a marker or hook value can never choose the program.
+		run := func(argv []string, timeout float64, dir string, env []string) Result {
+			return a.runMaintenanceProbe(append([]string{executable}, argv[1:]...), timeout, dir, env)
+		}
+		if reason := a.commandHoldWithRunner(holder, &Marker{Folder: a.Home, Owner: h.Name, Kind: "cache"}, run); reason != "" {
 			return reason
 		}
 	}

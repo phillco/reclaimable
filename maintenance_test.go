@@ -177,6 +177,29 @@ func TestMaintenanceConfigDirExecutables(t *testing.T) {
 	}
 }
 
+func TestMaintenanceBusyExecutableIgnoresPlaceholders(t *testing.T) {
+	for _, form := range []string{"bare", "absolute"} {
+		t.Run(form, func(t *testing.T) {
+			e, _ := maintenanceFixture(t)
+			bin := filepath.Join(e.Root, "bin")
+			must(t, os.MkdirAll(bin, 0755))
+			// A program named after the hook: it must never run via {owner}.
+			sentinel := filepath.Join(e.Root, "placeholder-ran")
+			fakeExecutable(t, bin, "fixture", fmt.Sprintf("touch %q\nexit 0\n", sentinel))
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			executable := "{owner}"
+			if form == "absolute" {
+				executable = filepath.Join(bin, "{owner}")
+			}
+			e.Cfg.Maintenance[0].BusyHolders = []map[string]any{{"name": "busy", "command": []string{executable}}}
+			rows, _ := maintenanceRun(t, e, Args{})
+			_, err := os.Stat(sentinel)
+			check(t, os.IsNotExist(err), "placeholder chose the busy executable: %+v", rows)
+			check(t, rows[0].Status != "success", "busy check with an unresolvable executable did not fail closed: %+v", rows)
+		})
+	}
+}
+
 func TestMaintenanceConfigDirDoesNotPermitRelativePaths(t *testing.T) {
 	for _, executable := range []string{"./helper", "bin/helper", "~/{config_dir}/helper", "prefix/{config_dir}/helper", "{folder}/helper", "{owner}/helper"} {
 		for _, busy := range []bool{false, true} {
