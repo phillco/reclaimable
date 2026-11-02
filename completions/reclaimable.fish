@@ -2,6 +2,7 @@
 set -l cmds mark touch hold release ls sweep maintenance status arm
 complete -c reclaimable -f
 complete -c reclaimable -s h -l help -d 'Show help'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -s V -l version -d 'Show version'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a mark -d 'Create/update a marker'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a touch -d 'Mark folders used now'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a hold -d 'Declare a job is reading a folder'

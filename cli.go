@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// Set by the release build with -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 func main() { os.Exit(newApp().main(os.Args[1:])) }
 
 func (a *App) fail(err error, code int) int {
@@ -22,6 +25,10 @@ func (a *App) fail(err error, code int) int {
 }
 
 func (a *App) main(argv []string) int {
+	if len(argv) == 1 && (argv[0] == "-V" || argv[0] == "--version") {
+		fmt.Fprintln(a.Out, "reclaimable", version)
+		return 0
+	}
 	args, help, err := parseArgs(argv)
 	if err != nil {
 		return a.fail(err, 2)
@@ -279,7 +286,7 @@ func parseArgs(argv []string) (Args, bool, error) {
 
 func (a *App) help(cmd string) {
 	if cmd == "" {
-		fmt.Fprintln(a.Out, "usage: reclaimable [-h] COMMAND ...\n\nJanitor for regenerable folders marked with `.reclaimable`.\n\ncommands:\n  mark     create/update a folder's .reclaimable marker\n  touch    mark folders used now\n  hold     declare a job is reading the folder\n  release  drop a job's hold\n  ls       list markers with age, size, TTL and eligibility\n  sweep    the janitor (dry-run unless this host is armed)\n  maintenance  run configured native cache hooks\n  status   armed state, free space, last sweep, log tail\n  arm      arm this host (scheduled sweeps act after 24h)\n\noptions:\n  -h, --help  show this help message and exit\n\nConfig: ~/.config/reclaimable/config.toml (see README)")
+		fmt.Fprintln(a.Out, "usage: reclaimable [-h] [-V] COMMAND ...\n\nJanitor for regenerable folders marked with `.reclaimable`.\n\ncommands:\n  mark     create/update a folder's .reclaimable marker\n  touch    mark folders used now\n  hold     declare a job is reading the folder\n  release  drop a job's hold\n  ls       list markers with age, size, TTL and eligibility\n  sweep    the janitor (dry-run unless this host is armed)\n  maintenance  run configured native cache hooks\n  status   armed state, free space, last sweep, log tail\n  arm      arm this host (scheduled sweeps act after 24h)\n\noptions:\n  -h, --help  show this help message and exit\n  -V, --version  show version and exit\n\nConfig: ~/.config/reclaimable/config.toml (see README)")
 		return
 	}
 	usage := map[string]string{"mark": "PATH -o OWNER [-t TTL] [-r REGEN] [-k KIND] [-j JOB] [-s SESSION] [-m MOVE_TO]", "touch": "PATH...", "hold": "PATH JOB [-p SUBPATH]", "release": "PATH JOB [-p SUBPATH]", "ls": "[ROOTS...] [-j] [-q] [-S]", "sweep": "[-n | -A] [-f FLOOR] [-t TARGET] [-S] [-v]", "maintenance": "[-n] [-o NAME] [-f]", "status": "[-l LINES]", "arm": "[-x]"}

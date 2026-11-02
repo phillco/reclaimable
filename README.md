@@ -21,6 +21,39 @@ reclaimable sweep -n            # dry run
 reclaimable arm                 # real sweeps begin 24 h later
 ```
 
+## Install
+
+With Go 1.22+:
+
+```sh
+go install github.com/phillco/reclaimable@latest
+```
+
+Prebuilt archives for macOS and Linux (arm64/amd64) are on the
+[Releases page](https://github.com/phillco/reclaimable/releases). Each contains the
+executable, README and project/dependency licenses. For example, set the release tag and target below,
+download with the [GitHub CLI](https://cli.github.com/), then verify before extracting:
+
+```sh
+version=v0.1.0  # replace with the desired release tag
+os=darwin      # darwin or linux
+arch=arm64     # arm64 or amd64
+archive="reclaimable_${version}_${os}_${arch}.tar.gz"
+gh release download "$version" --repo phillco/reclaimable \
+  --pattern "$archive" --pattern checksums.txt &&
+awk -v archive="$archive" '$2 == archive' checksums.txt | shasum -a 256 -c - &&
+gh attestation verify "$archive" --repo phillco/reclaimable &&
+tar -xzf "$archive" &&
+./reclaimable --version
+```
+
+The checksum checks download integrity; [attestation verification](https://cli.github.com/manual/gh_attestation_verify)
+checks that the archive was built by this repository's GitHub Actions workflow.
+Move the verified executable to a directory on your `PATH`.
+
+macOS binaries are not signed or notarized; browser downloads need
+`xattr -d com.apple.quarantine reclaimable` after extraction (curl/gh downloads do not).
+
 ## Marker
 
 `PATH/.reclaimable` is a JSON file:

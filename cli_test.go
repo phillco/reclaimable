@@ -9,6 +9,24 @@ import (
 	"time"
 )
 
+func TestVersionDoesNotLoadConfig(t *testing.T) {
+	for _, flag := range []string{"-V", "--version"} {
+		t.Run(flag, func(t *testing.T) {
+			e := newTestEnv(t)
+			e.A.LoadConfig = func() (*Config, error) {
+				t.Fatal("version must not load configuration")
+				return nil, nil
+			}
+			if code := e.A.main([]string{flag}); code != 0 {
+				t.Fatalf("version exit code: %d", code)
+			}
+			if got := e.A.Out.(*bytes.Buffer).String(); got != "reclaimable "+version+"\n" {
+				t.Fatalf("version output: %q", got)
+			}
+		})
+	}
+}
+
 func oldMarker(t *testing.T, folder string, seconds float64) {
 	t.Helper()
 	at := time.Now().Add(-time.Duration(seconds * 1e9))
