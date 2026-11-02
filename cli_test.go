@@ -206,6 +206,38 @@ func TestPlanMatchesVolumeFloorByAbsoluteMount(t *testing.T) {
 	chosen := e.A.plan([]*Verdict{v}, e.Cfg)
 	check(t, len(chosen) == 1 && chosen[0].V.Folder == f, "absolute volume key did not select data volume: %+v", chosen)
 }
+
+func TestPlanUsesCanonicalVolumeFloor(t *testing.T) {
+	for _, spelling := range []string{"MixedCase", "Cafe\u0301"} {
+		t.Run(spelling, func(t *testing.T) {
+			e := newTestEnv(t)
+			f := e.make(t, spelling+"/fresh", 3600, nil, map[string]any{"ttl": "3d"})
+			mount := filepath.Dir(f)
+			e.A.IsMount = func(p string) bool { return p == mount }
+			key := "/SYSTEM/VOLUMES/DATA" + strings.ToUpper(strings.ReplaceAll(mount, "e\u0301", "é"))
+			config := filepath.Join(e.Root, "volume-config.toml")
+			must(t, os.WriteFile(config, []byte("volume_floors = { \""+key+"\" = \"100\" }\n"), 0600))
+			cfg, err := e.A.loadConfig(config)
+			must(t, err)
+			e.Cfg.VolumeFloors = cfg.VolumeFloors
+			e.Cfg.Floor, e.Cfg.Target = 1000*gb, 2000*gb
+			v := e.A.evaluate(f, e.Cfg, e.Reg, true)
+			check(t, v.Safe && !v.Expired, "fresh fixture: %s", debugVerdict(v))
+			for _, estimate := range []bool{true, false} {
+				for _, free := range []int64{150 * gb, 50 * gb} {
+					e.A.FreeBytes = func(string) (int64, error) { return free, nil }
+					chosen, err := e.A.planChecked([]*Verdict{v}, e.Cfg, estimate)
+					must(t, err)
+					want := 0
+					if free < 100*gb {
+						want = 1
+					}
+					check(t, len(chosen) == want, "free=%d estimate=%v selected %d fresh folders, want %d", free, estimate, len(chosen), want)
+				}
+			}
+		})
+	}
+}
 func TestPressureSweepStopsWhenRealFreeSpaceReachesTarget(t *testing.T) {
 	e := newTestEnv(t)
 	folders := []string{}

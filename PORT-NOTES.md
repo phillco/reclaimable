@@ -42,6 +42,9 @@ sentinels are temporary. Remote tests use local shell/Python shims, with no remo
 host contacted. Go 1.22.12/current Go tests run on macOS arm64; Linux amd64/arm64
 cross-compile only (runtime unverified). Unicode matches 29,379 differential cases.
 
+Additional regressions cover canonical volume-floor lookup during planning and
+ignored directory symlinks in JJ/Git checkouts. These match the updated reference.
+
 ## Python to Go test mapping
 
 | Python function | Go test |

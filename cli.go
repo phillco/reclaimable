@@ -374,11 +374,9 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config, estimateOption ...bo
 			picked[v] = true
 		}
 	}
-	hs, e := os.Stat(a.Home)
-	if e != nil {
+	if _, e := os.Stat(a.Home); e != nil {
 		return nil, e
 	}
-	homeDev := device(hs)
 	byDev := map[uint64][]*Verdict{}
 	devs := []uint64{}
 	for _, v := range verdicts {
@@ -392,23 +390,9 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config, estimateOption ...bo
 	}
 	for _, dev := range devs {
 		group := byDev[dev]
-		mount, e := filepath.Abs(group[0].Folder)
-		if e != nil {
-			return nil, e
-		}
-		for !a.IsMount(mount) && filepath.Dir(mount) != mount {
-			mount = filepath.Dir(mount)
-		}
-		floor, ok := cfg.VolumeFloors[mount]
+		floor, target, ok := a.volumeLimits(group[0].Folder, cfg)
 		if !ok {
-			if dev != homeDev {
-				continue
-			}
-			floor = cfg.Floor
-		}
-		target := floor + targetMargin
-		if dev == homeDev {
-			target = cfg.Target
+			continue
 		}
 		free, e := a.FreeBytes(group[0].Folder)
 		if e != nil {

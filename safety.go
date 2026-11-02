@@ -671,12 +671,6 @@ func (a *App) ignoredFiles(folder, repo string) string {
 				}
 				continue
 			}
-			if st.Mode()&os.ModeSymlink != 0 {
-				// Classify directory links as os.walk does, while never entering them.
-				if target, err := a.StatAt(dir, name, true); err == nil && target.IsDir() {
-					continue
-				}
-			}
 			if rel != markerName && !tracked[rel] {
 				hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
 				return nil

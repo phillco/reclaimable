@@ -780,6 +780,45 @@ func TestIgnoredFileProbeFailuresKeepCheckout(t *testing.T) {
 	}
 }
 
+func TestIgnoredDirectorySymlinkNeedsIgnoredOk(t *testing.T) {
+	for _, repo := range []string{"jj-secondary", "git-linked"} {
+		t.Run(repo, func(t *testing.T) {
+			e := newTestEnv(t)
+			var folder string
+			if repo == "git-linked" {
+				main, wt := linkedWorktree(t, e, "ignored-link")
+				ignoreInMain(t, main, "ignored-link")
+				folder = wt
+			} else {
+				folder = e.make(t, "workspace", 30*day, nil, nil)
+				safetyWrite(t, filepath.Join(folder, ".jj/repo"), "fixture")
+				e.A.Run = func(args []string, _ float64, _ string, _ []string) Result {
+					if contains(args, "list") {
+						return Result{Stdout: "blob.bin\n"}
+					}
+					return Result{}
+				}
+			}
+			v := safetyEval(e, folder)
+			check(t, v.Safe, "clean fixture: %s", debugVerdict(v))
+			target := filepath.Join(e.Root, "outside")
+			safetyWrite(t, filepath.Join(target, "valuable.bin"), "irreplaceable")
+			must(t, os.Symlink(target, filepath.Join(folder, "ignored-link")))
+			v = safetyEval(e, folder)
+			check(t, !v.Safe && strings.Contains(v.Reason, "ignored_ok"), "ignored directory link accepted: %s", debugVerdict(v))
+			ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
+			check(t, !ok && exists(folder), "ignored link removed: %v %s", ok, detail)
+			m, err := e.A.readMarker(folder)
+			must(t, err)
+			m.Extra["ignored_ok"] = true
+			must(t, e.A.writeMarker(m))
+			removalAge(t, folder, 30*day)
+			check(t, safetyEval(e, folder).Safe, "explicit ignored_ok refused")
+			check(t, safetyRead(t, filepath.Join(target, "valuable.bin")) == "irreplaceable", "link target changed")
+		})
+	}
+}
+
 func TestIgnoredFileAddedDuringMoveKeepsSource(t *testing.T) {
 	e := newTestEnv(t)
 	main, wt := linkedWorktree(t, e, "ignored-during-move")
