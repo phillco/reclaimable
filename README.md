@@ -92,9 +92,26 @@ Paths are always normalised to absolute lexical paths (symlinks are never resolv
 they are refused) at `mark`, in the registry and at evaluation; a relative path found
 in the registry is ignored with a log line, never acted on.
 
-Markers are found by a bounded scan of `roots` (daily, or `-S`) and registered
+Markers are found by a depth-limited scan of `roots` (daily, or `-S`) and registered
 when created with `mark`. State lives in `~/.local/state/reclaimable/`, the log in
 `~/.local/log/reclaimable.log`, the armed flag in `~/.config/reclaimable/armed`.
+
+Without explicit `roots`, discovery uses home plus writable, accessible mounts
+under `/Volumes`, excluding Time Machine volumes and symlinks. Listing `/Volumes`
+and probing each candidate run in separate child processes, each with a two-second
+timeout. All mount and backup-marker metadata checks are inside that timeout.
+The probe checks access and opens then closes the root without reading its
+contents. A stalled or failed probe skips that volume and writes a warning to
+stderr and the log. Set `roots` explicitly to exclude unwanted volumes, or grant
+the binary access in macOS Privacy & Security. Rebuilding an ad-hoc-signed binary
+can invalidate its privacy grants.
+
+The marker walk checks a 120-second budget between filesystem operations and
+stops at eight directory levels. That budget cannot interrupt a blocked open,
+stat, or directory read, including a privacy prompt deeper inside a selected
+root. Explicit roots are scanned directly, without the default-volume probe.
+For unattended sweeps, set `roots` to responsive directories the binary can
+access; avoid unavailable mounts and grant any required privacy permissions.
 
 ## Safety model
 

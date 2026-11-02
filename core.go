@@ -338,22 +338,7 @@ func contains(items []string, s string) bool {
 	return false
 }
 func (a *App) defaultRoots() []string {
-	out := []string{a.Home}
-	entries, _ := os.ReadDir("/Volumes")
-	for _, e := range entries {
-		p := filepath.Join("/Volumes", e.Name())
-		if e.Type()&os.ModeSymlink != 0 || !e.IsDir() || !isMount(p) || exists(filepath.Join(p, "Backups.backupdb")) || exists(filepath.Join(p, ".timemachine")) {
-			continue
-		}
-		f, err := os.Open(p)
-		if err == nil {
-			f.Close()
-			if writable(p) {
-				out = append(out, p)
-			}
-		}
-	}
-	return out
+	return a.defaultRootsWith("/Volumes", 2, defaultRootCommand)
 }
 
 func writable(p string) bool { return syscall.Access(p, 2|4|1) == nil }
