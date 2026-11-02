@@ -524,7 +524,6 @@ def test_mirror_still_checks_nested_repos(env):
     main = make_repo_with_remote(env)
     f = make(env, "mir", age_s=30 * DAY, kind="mirror")
     git("clone", "-q", str(main), str(f / "inner"), cwd=env.root)
-    assert rc.evaluate(f, env.cfg, env.reg).safe
     (f / "inner/dirty").write_text("x")
     v = rc.evaluate(f, env.cfg, env.reg)
     assert not v.safe and "nested repo inner" in v.reason
@@ -710,3 +709,83 @@ def test_scan_does_not_descend_into_marked_or_denied(env):
     make(env, "secret/hidden")
     found, complete = rc.scan([env.root / "data"], env.cfg)
     assert found == {str(outer)}
+
+
+# --- symlinks, glob deny on descendants, nested primary repos -------------------
+
+
+def test_symlink_root_and_ancestor_refused_everywhere(env):
+    real = make(env, "real", age_s=30 * DAY, files={"keep.txt": b"precious"})
+    (real / ".reclaimable").unlink()
+    link = env.root / "data/link"
+    link.symlink_to(real, target_is_directory=True)
+    (real / ".reclaimable").write_text(
+        json.dumps({"owner": "t", "regenerate": "r", "holds": []})
+    )
+    old = time.time() - 30 * DAY
+    os.utime(real / ".reclaimable", (old, old))
+    # mark refuses a symlink root and a symlinked ancestor
+    assert rc.main(["mark", str(link), "-o", "t", "-r", "r"]) == 2
+    assert rc.main(["mark", str(link / "sub"), "-o", "t", "-r", "r"]) == 2
+    # evaluation refuses it even though a marker is reachable through the link
+    v = rc.evaluate(link, env.cfg, env.reg)
+    assert not v.safe and "symlink" in v.reason
+    assert not rc.evaluate(link, env.cfg, env.reg).safe
+    # final removal refuses it too, and never traverses it
+    v.safe, v.action = True, "delete"
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert (
+        not ok and (real / "keep.txt").read_bytes() == b"precious" and link.is_symlink()
+    )
+    with pytest.raises(OSError):
+        rc.rmtree_same_dev(link)
+    assert (real / "keep.txt").exists()
+
+
+def test_folder_swapped_for_symlink_before_rename_is_restored(env, monkeypatch):
+    f = make(env, "swap", age_s=30 * DAY)
+    victim = make(env, "victim", age_s=0, files={"keep.txt": b"precious"})
+    v = rc.evaluate(f, env.cfg, env.reg)
+    real_rename = os.rename
+    state = {"n": 0}
+
+    def rename(a, b):
+        if state["n"] == 0 and Path(a) == f:
+            # Simulate a race: the folder was replaced by a symlink just before the rename.
+            state["n"] += 1
+            moved = f.with_name("swapped-away")
+            real_rename(f, moved)
+            f.symlink_to(victim, target_is_directory=True)
+        return real_rename(a, b)
+
+    monkeypatch.setattr(rc.os, "rename", rename)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and (victim / "keep.txt").exists() and f.is_symlink()
+
+
+def test_glob_deny_paths_apply_to_descendants(env):
+    env.cfg.deny_paths.append(str(env.root / "data/*/models"))
+    f = make(env, "bucket", age_s=30 * DAY, files={"ok.bin": b"1"})
+    assert rc.evaluate(f, env.cfg, env.reg).safe
+    (f / "models").mkdir()
+    (f / "models/w.bin").write_bytes(b"w")
+    g = rc.evaluate(f, env.cfg, env.reg)
+    assert not g.safe and "deny-listed" in g.reason
+    # the denied folder itself is refused too
+    assert rc.deny_reason(f / "models", env.cfg)
+    # exact (non-glob) deny paths inside a marked folder count as well
+    h = make(env, "b2", age_s=30 * DAY, files={"inner/secret/x": b"1"})
+    env.cfg.deny_paths.append(str(h / "inner/secret"))
+    assert not rc.evaluate(h, env.cfg, env.reg).safe
+
+
+def test_nested_primary_repo_in_mirror_refused(env):
+    main = make_repo_with_remote(env)
+    f = make(env, "mir2", age_s=30 * DAY, kind="mirror")
+    git("clone", "-q", str(main), str(f / "inner"), cwd=env.root)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "nested git-primary" in v.reason
+    # a nested linked worktree is still fine
+    g = make(env, "mir3", age_s=30 * DAY, kind="mirror")
+    git("worktree", "add", "-q", "--detach", str(g / "wt"), cwd=main)
+    assert rc.evaluate(g, env.cfg, env.reg).safe

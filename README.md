@@ -75,7 +75,11 @@ completed keeps the folder (fail closed):
    unpushed commits. Primary repositories are never removed, only linked git
    worktrees (then `git worktree prune`) and secondary jj workspaces
    (`jj workspace forget` first).
-7. **Filesystem boundary**: folders containing another mounted filesystem are
+7. **Symlinks**: a marked folder, or any ancestor of it, that is a symlink is
+   refused (at `mark`, at evaluation and at removal); a symlink is never traversed.
+   Deny-list paths, including globs, also apply to everything inside a marked folder.
+   Nested primary git/jj repositories inside a marked folder keep it too.
+8. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
 
 The size walk doubles as the descendant deny check (names, sequences), which

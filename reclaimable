@@ -31,6 +31,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -477,6 +478,9 @@ def _deny_name_hit(parts, cfg: Config) -> str | None:
 def deny_reason(path: Path, cfg: Config) -> str | None:
     """Why `path` itself may never be marked or removed (None when allowed)."""
     path = expand(path)
+    link = next((p for p in (path, *path.parents) if p.is_symlink()), None)
+    if link is not None:
+        return f"symlink in path ({link}); mark the real directory"
     real = Path(os.path.realpath(path))
     for candidate in {path, real}:
         for raw in cfg.deny_exact:
@@ -1045,7 +1049,8 @@ def walk(
     repos: list[Path] = []
     crossed: list[Path] = []
     deadline = time.monotonic() + limit_s
-    dev = folder.stat().st_dev
+    dev = folder.lstat().st_dev
+    patterns = [str(expand(p)) for p in cfg.deny_paths]
     stack = [folder]
     while stack:
         if time.monotonic() > deadline:
@@ -1063,6 +1068,11 @@ def walk(
             size += st.st_blocks * 512
             files += 1
             rel = Path(e.path).relative_to(folder).parts
+            for pattern in patterns:
+                if fnmatch.fnmatchcase(e.path, pattern):
+                    return Walk(
+                        None, files, f"contains deny-listed {'/'.join(rel)}", repos
+                    )
             if check_names:
                 hit = _deny_name_hit(rel, cfg)
                 if hit:
@@ -1188,9 +1198,15 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
         v.reason = "kind worktree but no .git/.jj found"
         return v
     for nested in w.repos[:20]:
-        _, problem = repo_state(nested)
+        nested_kind, problem = repo_state(nested)
         if problem:
             v.reason = f"nested repo {nested.relative_to(folder)} {problem}"
+            return v
+        if nested_kind in ("git-primary", "jj-primary"):
+            v.reason = (
+                f"nested {nested_kind} repository {nested.relative_to(folder)} "
+                "(only linked worktrees / secondary workspaces are removable)"
+            )
             return v
     if len(w.repos) > 20:
         v.reason = f"{len(w.repos)} nested repos (too many to verify)"
@@ -1323,7 +1339,10 @@ def move_and_verify(
 def rmtree_same_dev(path: Path) -> list[Path]:
     """Delete `path` without crossing into other filesystems. Returns the directories
     left behind because they are mount points (or could not be removed)."""
-    dev = path.lstat().st_dev
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"refusing to remove {path}: not a real directory")
+    dev = st.st_dev
     left: list[Path] = []
 
     def clear(d: Path) -> bool:
@@ -1369,7 +1388,7 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
     if os.path.ismount(v.folder):
         return False, "folder is a mount point"
     try:
-        ident = v.folder.stat()
+        ident = v.folder.lstat()
     except OSError as e:
         return False, f"folder unreadable: {e.strerror}"
 
@@ -1383,7 +1402,7 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
         if deny_reason(v.folder, cfg):
             return "refused by deny-list"
         try:
-            now_stat = v.folder.stat()
+            now_stat = v.folder.lstat()
         except OSError as e:
             return f"folder unreadable: {e.strerror}"
         if (now_stat.st_dev, now_stat.st_ino) != (ident.st_dev, ident.st_ino):
@@ -1445,6 +1464,10 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
                 return False, f"jj workspace forget failed: {res.stderr.strip()[:100]}"
         trash = v.folder.with_name(f".{v.folder.name}.reclaimable-trash-{int(now())}")
         os.rename(v.folder, trash)
+        if trash.is_symlink() or not trash.is_dir():
+            # Swapped for a symlink after the check: put it back untouched.
+            os.rename(trash, v.folder)
+            return False, "folder became a symlink; restored, nothing deleted"
     left = rmtree_same_dev(trash)
     if common:
         run(["git", "--git-dir", str(common), "worktree", "prune"], timeout=60)
