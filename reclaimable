@@ -233,6 +233,7 @@ class Config:
     remote_command: list[str] = field(
         default_factory=lambda: list(DEFAULT_REMOTE_COMMAND)
     )
+    session_grace: float | None = None
 
 
 def _strings(raw: dict, key: str) -> list[str]:
@@ -336,6 +337,8 @@ def load_config(path: Path | None = None) -> Config:
         if not isinstance(job_done, dict):
             raise SystemExit("reclaimable: [job_done] must be a table")
         _command(job_done, "[job_done]")
+    grace = raw.get("session_grace")
+    session_grace = None if grace is None else parse_ttl(str(grace))
     export = raw.get("exclude_list_path")
     remote = raw.get("remote_command")
     if remote is not None:
@@ -359,6 +362,7 @@ def load_config(path: Path | None = None) -> Config:
         export_list=expand(export) if export else None,
         export_format=str(raw.get("exclude_list_format", "{path}")),
         remote_command=list(remote or DEFAULT_REMOTE_COMMAND),
+        session_grace=session_grace,
     )
 
 
@@ -1148,6 +1152,7 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
     if m.holds:
         v.reason = "held by " + ", ".join(str(h.get("job")) for h in m.holds)
         return v
+    closed_at = None
     if m.job:
         closed, closed_at, detail = job_closed(m.job, cfg, reg)
         if not closed:
@@ -1156,6 +1161,29 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
         start = max(start, closed_at or 0)
     if m.session:
         running = session_running(m.session)
+        if (
+            running is None
+            and cfg.session_grace is not None
+            and m.job
+            and not m.session.isdigit()
+        ):
+            # Non-pid session that can't be observed: gone once the job has been
+            # closed for `session_grace` (measured from the job's close time).
+            if not closed_at:
+                v.reason = f"session {m.session[:12]} unknown and job close time unavailable"
+                entry.pop("session_exit_seen", None)
+                return v
+            ready = closed_at + cfg.session_grace
+            if now() < ready:
+                v.reason = (
+                    f"session {m.session[:12]} within grace "
+                    f"(job closed {human_age(now() - closed_at)} ago, "
+                    f"grace {human_age(cfg.session_grace)})"
+                )
+                entry.pop("session_exit_seen", None)
+                return v
+            running = False
+            entry.setdefault("session_exit_seen", ready)
         if running is None:
             v.reason = f"session {m.session[:12]} state unknown"
             entry.pop("session_exit_seen", None)

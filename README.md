@@ -69,7 +69,8 @@ completed keeps the folder (fail closed):
 5. **Job-tied data** (`job`): the `job_done` command must report the job closed,
    and the `session` (a pid, or text matched against the process list) must be
    gone. A numeric session is checked exactly; a non-numeric one is only known to
-   be alive when found, so a miss keeps the folder as "unknown".
+   be alive when found, so a miss keeps the folder as "unknown" unless
+   `session_grace` is set (see below).
 6. **Worktrees**: anything with `.git`/`.jj` at its top, and any repo nested inside
    a marked folder (also in `mirror` folders), is refused when dirty or with
    unpushed commits. Primary repositories are never removed, only linked git
@@ -118,6 +119,13 @@ deny = ["~/keep-me", "/Volumes/Archive/*"]    # paths (globs ok): inside, contai
 deny_names = ["golden-*"]                     # component names, on the path or anywhere inside
 deny_sequences = [["experiments", "results"]] # consecutive component names
 deny_exact = ["~/src"]                        # the folder itself may never be marked
+
+# Non-numeric sessions can't be observed reliably (their id may never appear in a command
+# line). Unset (default): a session the process list doesn't show is "unknown" and keeps the
+# folder. With a grace, such a session counts as gone only if the job is closed AND now >=
+# the job's close time + grace; no close time (job_done printed none) keeps the folder.
+# Numeric pids are always checked exactly; a process-list hit always blocks.
+session_grace = "72h"
 
 [default_ttls]
 cache = "12h"

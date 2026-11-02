@@ -789,3 +789,94 @@ def test_nested_primary_repo_in_mirror_refused(env):
     g = make(env, "mir3", age_s=30 * DAY, kind="mirror")
     git("worktree", "add", "-q", "--detach", str(g / "wt"), cwd=main)
     assert rc.evaluate(g, env.cfg, env.reg).safe
+
+
+# --- session_grace ----------------------------------------------------------------
+
+
+def iso_ago(s):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - s))
+
+
+def test_session_grace_unset_keeps_unobservable_session(env, monkeypatch):
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    v = rc.evaluate(
+        make(env, "j", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    )
+    assert not v.safe and "unknown" in v.reason
+
+
+def test_session_grace_not_elapsed_keeps(env, monkeypatch):
+    env.cfg.session_grace = 72 * 3600
+    set_job(env, "5", f"closed {iso_ago(DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    v = rc.evaluate(
+        make(env, "j", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    )
+    assert not v.safe and "within grace" in v.reason
+
+
+def test_session_grace_elapsed_counts_as_gone(env, monkeypatch):
+    env.cfg.session_grace = 3 * DAY
+    set_job(env, "5", f"closed {iso_ago(10 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    f = make(env, "j", age_s=30 * DAY, job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.expired, v.reason
+    # the TTL clock starts when the grace ended (7d ago), not at mark time
+    assert 6.9 * DAY < time.time() - v.clock_start < 7.1 * DAY
+
+
+def test_session_grace_missing_close_time_keeps(env, monkeypatch):
+    env.cfg.session_grace = 72 * 3600
+    set_job(env, "5", "closed")  # closed, no timestamp
+    fake_pgrep(monkeypatch, 1)
+    v = rc.evaluate(
+        make(env, "j", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    )
+    assert not v.safe and "close time unavailable" in v.reason
+    set_job(env, "5", "closed garbage")
+    env.reg["jobs"] = {}
+    assert not rc.evaluate(
+        make(env, "k", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    ).safe
+
+
+def test_session_grace_needs_closed_job_and_ignores_pids_and_live_hits(
+    env, monkeypatch
+):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", "open")
+    fake_pgrep(monkeypatch, 1)
+    assert not rc.evaluate(
+        make(env, "o", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    ).safe
+    set_job(env, "6", f"closed {iso_ago(30 * DAY)}")
+    # a live pgrep hit still blocks
+    fake_pgrep(monkeypatch, 0)
+    v = rc.evaluate(
+        make(env, "h", age_s=30 * DAY, job="6", session="sess-x"), env.cfg, env.reg
+    )
+    assert not v.safe and "still running" in v.reason
+    # numeric pids stay exact: a live pid blocks regardless of grace, a dead one is gone
+    live = rc.evaluate(
+        make(env, "p", age_s=30 * DAY, job="6", session=str(os.getpid())),
+        env.cfg,
+        env.reg,
+    )
+    assert not live.safe and "still running" in live.reason
+    dead = rc.evaluate(
+        make(env, "d", age_s=30 * DAY, job="6", session="999999"), env.cfg, env.reg
+    )
+    assert dead.safe
+
+
+def test_session_grace_config_parsing(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('session_grace = "72h"\n')
+    assert _fresh().load_config(p).session_grace == 72 * 3600
+    assert _fresh().load_config(tmp_path / "none.toml").session_grace is None
+    p.write_text('session_grace = "soon"\n')
+    with pytest.raises(ValueError):
+        _fresh().load_config(p)
