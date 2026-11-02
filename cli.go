@@ -329,6 +329,36 @@ func (a *App) plan(verdicts []*Verdict, cfg *Config) []Planned {
 	return chosen
 }
 
+func (a *App) volumeLimits(folder string, cfg *Config) (floor, target int64, ok bool) {
+	st, err := os.Stat(folder)
+	if err != nil {
+		return 0, 0, false
+	}
+	home, err := os.Stat(a.Home)
+	if err != nil {
+		return 0, 0, false
+	}
+	mount, err := filepath.Abs(folder)
+	if err != nil {
+		return 0, 0, false
+	}
+	for !isMount(mount) && filepath.Dir(mount) != mount {
+		mount = filepath.Dir(mount)
+	}
+	floor, ok = cfg.VolumeFloors[a.expand(mount)]
+	if !ok {
+		if device(st) != device(home) {
+			return 0, 0, false
+		}
+		floor = cfg.Floor
+	}
+	target = floor + targetMargin
+	if device(st) == device(home) {
+		target = cfg.Target
+	}
+	return floor, target, true
+}
+
 func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
 	chosen := []Planned{}
 	picked := map[*Verdict]bool{}
@@ -449,6 +479,8 @@ func (a *App) sweep(args Args, cfg *Config) int {
 	}
 	done := []map[string]any{}
 	acted := map[*Verdict]bool{}
+	freedOn := map[uint64]int64{}
+	startFree := map[uint64]int64{}
 	var freed, would int64
 	for _, p := range actions {
 		v := p.V
@@ -457,7 +489,47 @@ func (a *App) sweep(args Args, cfg *Config) int {
 		if v.Action == "move" {
 			verb = "move"
 		}
-		ok, detail := a.removeFolder(v, armed, cfg, reg)
+		pressure := strings.HasPrefix(p.Why, "low space")
+		var dev uint64
+		devKnown := false
+		if armed && pressure {
+			_, target, limited := a.volumeLimits(v.Folder, cfg)
+			if st, err := os.Stat(v.Folder); err == nil {
+				dev, devKnown = device(st), true
+			}
+			if limited && devKnown {
+				start, err := a.FreeBytes(v.Folder)
+				if err != nil {
+					return a.fail(err, 1)
+				}
+				if _, ok := startFree[dev]; !ok {
+					startFree[dev] = start
+				}
+				real, err := a.FreeBytes(v.Folder)
+				if err != nil {
+					return a.fail(err, 1)
+				}
+				estimated := startFree[dev] + freedOn[dev]
+				if max(real, 0) >= target || estimated >= target {
+					line := fmt.Sprintf("skip %s: free space target reached (%s free >= %s)", v.Folder, humanBytes(&real), humanBytes(&target))
+					if err := a.log(line); err != nil {
+						return a.fail(err, 1)
+					}
+					fmt.Fprintln(a.Out, line)
+					row := a.row(v)
+					row["why"], row["done"], row["detail"] = p.Why, false, "target reached"
+					done = append(done, row)
+					if v.Size != nil {
+						would += *v.Size
+					}
+					continue
+				}
+			}
+		}
+		ok, detail := a.removeFolder(v, armed, cfg, reg, pressure)
+		if ok && devKnown && v.Size != nil {
+			freedOn[dev] += *v.Size
+		}
 		prefix, action := "", verb
 		if !armed {
 			prefix = "[dry-run] "

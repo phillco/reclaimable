@@ -395,7 +395,8 @@ func (a *App) rmtreeSameDev(path string) ([]string, error) {
 	}
 	return left, nil
 }
-func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]any) (bool, string) {
+func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]any, floorPressure ...bool) (bool, string) {
+	pressure := len(floorPressure) > 0 && floorPressure[0]
 	if !armed {
 		return false, "dry-run"
 	}
@@ -447,15 +448,21 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 		if reason := a.sessionProblem(fresh, cfg, markerEntry(reg, v.Folder, a.Now()), closedAt); reason != "" {
 			return reason
 		}
-		start := fresh.Mtime
-		if closedAt != nil {
-			start = max(start, *closedAt)
-		}
-		if fresh.Session != "" {
-			start = max(start, number(markerEntry(reg, v.Folder, a.Now())["session_exit_seen"]))
-		}
-		if v.Expired && a.Now()-start < v.TTLS {
-			return "job/session clock changed since evaluation; TTL not expired"
+		if !pressure {
+			start := fresh.Mtime
+			if fresh.Job != "" && closedAt != nil {
+				start = max(start, *closedAt)
+			}
+			if fresh.Session != "" {
+				start = max(start, number(markerEntry(reg, v.Folder, a.Now())["session_exit_seen"]))
+			}
+			ttl, err := parseTTL(a.markerTTL(fresh))
+			if err != nil {
+				return "bad marker: " + err.Error()
+			}
+			if a.Now()-start < ttl {
+				return fmt.Sprintf("no longer expired (clock restarted %s ago, ttl %s)", humanAge(a.Now()-start), humanAge(ttl))
+			}
 		}
 		w := a.walk(v.Folder, cfg, true, 300)
 		reason, repo := a.treeProblem(v.Folder, fresh, cfg, w)
