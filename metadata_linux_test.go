@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestLocalCopyPreservesExtendedAttributes(t *testing.T) {
+func TestLocalCopyRefusesUnverifiedExtendedAttributes(t *testing.T) {
 	e := newTestEnv(t)
 	src := filepath.Join(e.Root, "attrs-source")
 	removalWrite(t, filepath.Join(src, "file"), "content")
@@ -18,11 +18,12 @@ func TestLocalCopyPreservesExtendedAttributes(t *testing.T) {
 		must(t, err)
 	}
 	dest := filepath.Join(e.Root, "attrs-copy")
-	must(t, e.A.copyTree(src, dest))
-	for _, p := range []string{dest, filepath.Join(dest, "file")} {
+	err := e.A.copyTree(src, dest)
+	check(t, err != nil, "extended data copied without verification")
+	for _, p := range []string{src, filepath.Join(src, "file")} {
 		value := make([]byte, 32)
 		n, err := syscall.Getxattr(p, "user.fixture", value)
 		must(t, err)
-		check(t, string(value[:n]) == "retained", "attribute lost at %s", p)
+		check(t, string(value[:n]) == "retained", "source attribute lost")
 	}
 }

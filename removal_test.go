@@ -50,10 +50,10 @@ func TestMoveVerifiesThenDeletes(t *testing.T) {
 func TestHashMismatchKeepsSource(t *testing.T) {
 	e := newTestEnv(t)
 	f := e.make(t, "scratch2", 30*day, map[string][]byte{"a.txt": []byte("hello")}, nil)
-	real := e.A.FileHashes
+	real := e.A.HashDir
 	calls := 0
-	e.A.FileHashes = func(root string) (map[string]string, error) {
-		out, err := real(root)
+	e.A.HashDir = func(dir *os.File, root string) (map[string]string, error) {
+		out, err := real(dir, root)
 		calls++
 		if calls == 2 {
 			out["a.txt"] = strings.Repeat("0", 64)

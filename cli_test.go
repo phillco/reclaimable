@@ -232,3 +232,27 @@ func TestPressureSweepStopsWhenRealFreeSpaceReachesTarget(t *testing.T) {
 	}
 	check(t, kept == 2 && !exists(folders[0]), "only oldest should be removed: %d retained", kept)
 }
+
+func TestPressureSweepContinuesWhenEstimateOverstatesReclaimedSpace(t *testing.T) {
+	e := newTestEnv(t)
+	folders := []string{}
+	for i, name := range []string{"oldest", "middle", "newest"} {
+		folders = append(folders, e.make(t, name, float64(10-i)*3600, nil, map[string]any{"ttl": "3d"}))
+	}
+	e.Cfg.Floor, e.Cfg.Target = 100, 300
+	e.A.FreeBytes = func(string) (int64, error) {
+		removed := 0
+		for _, f := range folders {
+			if !exists(f) {
+				removed++
+			}
+		}
+		if removed >= 2 {
+			return 300, nil
+		}
+		return 0, nil
+	}
+	must(t, writeJSON(e.A.ArmedFile, map[string]any{"armed_at": e.A.Now() - 2*day}))
+	check(t, e.A.sweep(Args{Scan: true}, e.Cfg) == 0, "pressure sweep failed")
+	check(t, !exists(folders[0]) && !exists(folders[1]) && exists(folders[2]), "allocation estimates prematurely stopped real pressure cleanup")
+}

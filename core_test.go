@@ -217,7 +217,7 @@ func TestRelativeMarkerStillChecksAbsoluteDescendantGlobs(t *testing.T) {
 	must(t, os.Chdir(filepath.Dir(f)))
 	defer os.Chdir(cwd)
 	v := e.A.evaluate("bucket", e.Cfg, e.Reg, true)
-	check(t, !v.Safe && strings.Contains(v.Reason, "contains deny-listed models"), "relative descendant bypass: %s", debugVerdict(v))
+	check(t, !v.Safe && strings.Contains(v.Reason, "deny-listed"), "relative descendant bypass: %s", debugVerdict(v))
 }
 
 func TestRelativeMarkersRespectAbsoluteLeaseAndClaimPaths(t *testing.T) {

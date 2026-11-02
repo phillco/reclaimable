@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -749,14 +750,14 @@ def test_folder_swapped_for_symlink_before_rename_is_restored(env, monkeypatch):
     real_rename = os.rename
     state = {"n": 0}
 
-    def rename(a, b):
-        if state["n"] == 0 and Path(a) == f:
+    def rename(a, b, **kwargs):
+        if state["n"] == 0 and (Path(a) == f or a == f.name):
             # Simulate a race: the folder was replaced by a symlink just before the rename.
             state["n"] += 1
             moved = f.with_name("swapped-away")
             real_rename(f, moved)
             f.symlink_to(victim, target_is_directory=True)
-        return real_rename(a, b)
+        return real_rename(a, b, **kwargs)
 
     monkeypatch.setattr(rc.os, "rename", rename)
     ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
@@ -1339,6 +1340,27 @@ def test_pressure_sweep_stops_when_real_free_space_reaches_target(env, monkeypat
     )
 
 
+def test_pressure_sweep_continues_when_estimate_overstates_reclaimed_space(
+    env, monkeypatch
+):
+    folders = [
+        make(env, name, age_s=(10 - i) * 3600, ttl="3d")
+        for i, name in enumerate(("oldest", "middle", "newest"))
+    ]
+    monkeypatch.setattr(rc, "HOME", env.root)
+    env.cfg.floor, env.cfg.target = 100, 300
+    monkeypatch.setattr(rc, "armed_state", lambda: (True, "armed fixture"))
+    monkeypatch.setattr(
+        rc,
+        "free_bytes",
+        lambda path: 300 if sum(not f.exists() for f in folders) >= 2 else 0,
+    )
+    # Each allocation estimate exceeds the target; actual reclaim needs two.
+    rc.sweep(sweep_args(), env.cfg)
+    assert not folders[0].exists() and not folders[1].exists()
+    assert folders[2].exists()
+
+
 def ignore_in_main(main, pattern):
     exclude = main / ".git/info/exclude"
     exclude.parent.mkdir(exist_ok=True)
@@ -1500,3 +1522,322 @@ def test_identity_catches_other_spellings_of_a_protected_dir(env):
     assert rc.identity(other) == rc.identity(protected)
     assert rc.deny_reason(other, env.cfg)
     assert rc.protected_identities(env.cfg)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "/system/volumes/data",
+        "/sYsTeM/vOlUmEs/dAtA",
+        "/ſystem/Volumes/Data",  # folding changes the original component's spelling
+        "/Ｓystem/Volumes/Data",  # conservative compatibility normalisation
+    ],
+)
+def test_data_prefix_variants_block_combined_glob_bypass(env, prefix):
+    f = make(env, "bucket", age_s=30 * DAY, files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(str(env.root / "data/*/models"))
+    v = rc.evaluate(Path(prefix + str(f)), env.cfg, env.reg)
+    assert v.folder == f
+    assert not v.safe and "deny-list" in v.reason
+    assert (f / "models/weights").read_bytes() == b"keep"
+
+
+def test_decomposed_data_prefix_is_canonical(env, monkeypatch):
+    # The real prefix is ASCII (NFD is identical). An accented test prefix proves
+    # canonical composition works without creating anything outside this fixture.
+    monkeypatch.setattr(rc, "DATA_VOLUME", "/Systém/Volumes/Data")
+    f = make(env, "café", files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(str(env.root / "data/*/models"))
+    prefix = unicodedata.normalize("NFD", rc.DATA_VOLUME).swapcase()
+    v = rc.evaluate(Path(prefix + str(f)), env.cfg, env.reg)
+    assert v.folder == f
+    assert not v.safe and "deny-list" in v.reason
+
+
+@pytest.mark.parametrize("pattern", ["*.bin", "[w]*.bin", "?.bin"])
+def test_glob_deny_protects_hardlink_identity(env, pattern):
+    protected = env.root / "protected"
+    protected.mkdir()
+    target = protected / "w.bin"
+    target.write_bytes(b"keep")
+    f = make(env, "bucket")
+    os.link(target, f / "innocent")
+    env.cfg.deny_paths.append(str(protected / pattern))
+    assert rc.identity(target) in rc.protected_identities(env.cfg)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "deny-list" in v.reason
+
+
+def test_glob_identity_expansion_folds_literal_components(env):
+    protected = env.root / "café-keep"
+    protected.mkdir()
+    target = protected / "Weights.bin"
+    target.write_bytes(b"keep")
+    f = make(env, "bucket")
+    os.link(target, f / "innocent")
+    env.cfg.deny_paths.append(str(env.root / "CAFÉ-KEEP/*.BIN"))
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+
+
+def test_unreadable_deny_glob_fails_closed(env, monkeypatch):
+    f = make(env, "bucket")
+    protected = env.root / "protected"
+    protected.mkdir()
+    env.cfg.deny_paths.append(str(protected / "*/models"))
+    original = rc.list_dir
+
+    def unreadable(path):
+        if path == protected:
+            raise rc.Unreadable("permission denied")
+        return original(path)
+
+    monkeypatch.setattr(rc, "list_dir", unreadable)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "unreadable" in v.reason
+    assert rc.deny_reason(f, env.cfg)
+
+
+@pytest.mark.parametrize("prefix", ["/system/volumes/data", "/sYsTeM/vOlUmEs/dAtA"])
+def test_data_prefix_variants_in_deny_patterns_and_walk(env, prefix):
+    f = make(env, "bucket", files={"models/weights": b"keep"})
+    env.cfg.deny_paths.append(prefix + str(env.root / "data/*/models"))
+    assert rc.walk(f, env.cfg, check_names=True).problem
+    assert rc.deny_reason(Path(prefix + str(f / "models")), env.cfg)
+    assert rc.deny_reason(Path(prefix + "/Users"), env.cfg)
+
+
+def test_related_paths_fold_normalise_and_strip_prefix(env):
+    f = make(env, "café")
+    ref = Path("/system/volumes/data" + unicodedata.normalize("NFD", str(f)).upper())
+    assert rc.related(ref / "child", f)
+    assert rc.related(f, ref / "child")
+    assert not rc.related(f, f.with_name(f.name + "-other"))
+
+
+def test_lease_data_alias_and_case_variant_holds(env):
+    f = make(env, "café")
+    leases = env.root / "leases"
+    leases.mkdir()
+    (leases / "1.json").write_text(
+        json.dumps(
+            {"pid": os.getpid(), "what": "/system/volumes/data" + str(f).upper()}
+        )
+    )
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "lease" in v.reason
+
+
+def test_discovery_roots_use_canonical_comparisons(env):
+    f = make(env, "café")
+    reg = {"markers": {str(f): {}}, "last_scan": rc.now()}
+    root = Path("/system/volumes/data" + str(f.parent).upper())
+    assert rc.discover(env.cfg, reg, roots=[root]) == [f]
+
+
+def test_export_broad_roots_use_canonical_comparisons(env, monkeypatch):
+    monkeypatch.setattr(rc, "HOME", env.root / "Home")
+    assert not rc.export_ok(Path("/system/volumes/data" + str(rc.HOME).upper()))
+    assert not rc.export_ok(Path("/system/volumes/data/uSeRs/example"))
+
+
+def test_double_slash_data_prefix_and_component_boundaries(env):
+    assert rc.expand("//sYsTeM/Volumes/Data/Users") == Path("/Users")
+    assert rc.deny_reason(Path("//Users"), env.cfg)
+    assert rc.expand("/System/Volumes/Database/x") == Path("/System/Volumes/Database/x")
+
+
+def test_scan_pruning_folds_paths_and_names(env, monkeypatch):
+    make(env, "NODE_MODULES/cache")
+    make(env, "ordinary/.GIT/cache")
+    f = make(env, "café/cache")
+    monkeypatch.setattr(rc, "SCAN_PRUNE_PATHS", [str(f.parent).upper()])
+    found, complete = rc.scan(env.cfg.roots, env.cfg)
+    assert complete and not found
+
+
+def test_hold_paths_deduplicate_and_release_canonical_alias(env):
+    f = make(env, "café")
+    child = str(f / "part")
+    other = "/sYsTeM/Volumes/Data" + unicodedata.normalize("NFD", child).upper()
+    assert rc.main(["hold", str(f), "job42", "-p", child]) == 0
+    assert rc.main(["hold", str(f), "job42", "-p", other]) == 0
+    assert len(rc.read_marker(f).holds) == 1
+    assert rc.main(["release", str(f), "job42", "-p", child]) == 0
+    assert not rc.read_marker(f).holds
+
+
+def test_volume_floor_lookup_uses_canonical_path(env, monkeypatch):
+    f = make(env, "bucket")
+    monkeypatch.setattr(rc.os.path, "ismount", lambda p: p == f.parent)
+    env.cfg.volume_floors = {"/system/volumes/data" + str(f.parent).upper(): 123}
+    assert rc.volume_limits(f, env.cfg)[0] == 123
+
+
+def test_glob_ancestor_identity_protects_other_alias(env, monkeypatch):
+    protected = env.root / "keep"
+    target = protected / "child"
+    target.mkdir(parents=True)
+    f = make(env, "bucket")
+    env.cfg.deny_paths.append(str(protected / "chi?d"))
+    original = rc.identity
+    # Simulate a non-symlink directory alias without needing another mount.
+    monkeypatch.setattr(
+        rc, "identity", lambda p: original(protected) if p == f else original(p)
+    )
+    assert rc.deny_reason(f, env.cfg)
+
+
+def test_missing_glob_is_not_a_global_veto(env):
+    f = make(env, "bucket")
+    env.cfg.deny_paths.append(str(env.root / "absent/*/models"))
+    assert rc.evaluate(f, env.cfg, env.reg).safe
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"holds": [{"job": "busy"}]},
+        {"job": "busy"},
+        {"session": str(os.getpid())},
+        {"ttl": "99d"},
+        {"move_to": "archive"},
+    ],
+)
+def test_nested_marker_independent_protection(env, marker):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/deep/inner", age_s=30 * DAY, **marker)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+    assert nested.exists()
+
+
+@pytest.mark.parametrize("name", [".reclaimable", ".RECLAIMABLE", ".ReClAiMaBlE"])
+def test_nested_marker_case_variants_protect_ancestor(env, name):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/a/b/inner", age_s=30 * DAY, holds=[{"job": "busy"}])
+    (nested / rc.MARKER).rename(nested / name)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+
+
+def test_expired_nested_marker_can_be_removed_with_ancestor(env):
+    outer = make(env, "outer", age_s=30 * DAY)
+    make(env, "outer/a/b/inner", age_s=30 * DAY)
+    assert rc.evaluate(outer, env.cfg, env.reg).safe
+
+
+def test_nested_marker_uses_its_own_holder_context(env, monkeypatch):
+    outer = make(env, "outer", age_s=30 * DAY)
+    make(env, "outer/inner", age_s=30 * DAY, owner="busy-owner")
+    monkeypatch.setattr(
+        rc, "holder_hold", lambda m, cfg: "busy" if m.owner == "busy-owner" else None
+    )
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason and "held" in v.reason
+
+
+@pytest.mark.parametrize("problem", ["malformed", "symlink", "directory"])
+def test_invalid_nested_marker_fails_closed(env, problem):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    marker = nested / rc.MARKER
+    if problem == "malformed":
+        marker.write_text("not json")
+    else:
+        marker.unlink()
+        if problem == "symlink":
+            marker.symlink_to(outer / rc.MARKER)
+        else:
+            marker.mkdir()
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason
+
+
+@pytest.mark.parametrize("change", ["hold", "touch"])
+def test_nested_marker_rechecked_before_ancestor_removal(env, change):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert v.safe
+    if change == "hold":
+        m = rc.read_marker(nested)
+        m.holds = [{"job": "busy"}]
+        rc.write_marker(m)
+    else:
+        os.utime(nested / rc.MARKER)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg, floor_pressure=True)
+    assert not ok and "nested marker" in detail
+    assert outer.exists() and nested.exists()
+
+
+def test_outer_ignored_ok_does_not_override_nested_marker(env):
+    main = make_repo_with_remote(env)
+    outer = make(env, "outer", age_s=30 * DAY, ignored_ok=True)
+    nested = outer / "wt"
+    git("worktree", "add", "-q", "--detach", str(nested), cwd=main)
+    (nested / ".gitignore").write_text("private.bin\n")
+    git("add", ".gitignore", cwd=nested)
+    git(
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "ignore",
+        cwd=nested,
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/ignored", cwd=nested)
+    (nested / "private.bin").write_bytes(b"keep")
+    (nested / rc.MARKER).write_text(
+        json.dumps({"owner": "t", "regenerate": "r", "ignored_ok": False})
+    )
+    old = time.time() - 30 * DAY
+    os.utime(nested / rc.MARKER, (old, old))
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "ignored_ok" in v.reason
+
+
+def test_nested_marker_final_copy_recheck_keeps_source(env, monkeypatch):
+    outer, _ = make_movable(env)
+    nested = make(env, "scratch1/inner", age_s=30 * DAY)
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert v.safe
+
+    def copy_then_hold(*args, **kwargs):
+        marker = rc.read_marker(nested)
+        marker.holds = [{"job": "busy"}]
+        rc.write_marker(marker)
+        return True, "copied fixture"
+
+    monkeypatch.setattr(rc, "move_and_verify", copy_then_hold)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "nested marker" in detail and "held" in detail
+    assert outer.exists() and nested.exists()
+
+
+def test_nested_marker_own_deny_exact_keeps_ancestor(env):
+    outer = make(env, "outer", age_s=30 * DAY)
+    nested = make(env, "outer/inner", age_s=30 * DAY)
+    env.cfg.deny_exact.append(str(nested))
+    v = rc.evaluate(outer, env.cfg, env.reg)
+    assert not v.safe and "nested marker" in v.reason and "broad folder" in v.reason
+
+
+def test_nested_marker_ignored_ok_independent_and_inherited(env, monkeypatch):
+    outer = make(env, "outer", age_s=30 * DAY, ignored_ok=True)
+    nested = make(env, "outer/inner", age_s=30 * DAY, ignored_ok=False)
+    repo = nested / "wt"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: fixture")
+    monkeypatch.setattr(
+        rc, "repo_state", lambda p: ("git-linked", None) if p == repo else (None, None)
+    )
+    monkeypatch.setattr(
+        rc,
+        "ignored_files",
+        lambda p, kind: "contains ignored files; marker lacks ignored_ok",
+    )
+    assert not rc.evaluate(outer, env.cfg, env.reg).safe
+    (nested / rc.MARKER).unlink()
+    assert rc.evaluate(outer, env.cfg, env.reg).safe

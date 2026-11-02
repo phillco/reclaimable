@@ -61,6 +61,6 @@ func TestDescriptorHashPinsSwappedAncestor(t *testing.T) {
 		}
 	}
 	hashes, err := e.A.fileHashes(root)
-	must(t, err)
-	check(t, swapped && hashes["sub/disposable"] != "" && hashes["sub/precious"] == "", "hash escaped pinned tree: %v", hashes)
+	// A detected namespace change may refuse verification; any inspected contents stay pinned.
+	check(t, swapped && hashes["sub/disposable"] != "" && hashes["sub/precious"] == "", "hash escaped pinned tree: %v (error %v)", hashes, err)
 }

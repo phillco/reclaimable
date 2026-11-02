@@ -893,3 +893,185 @@ func TestIgnoredWorkspaceWalkRejectsChildSwap(t *testing.T) {
 	check(t, swapped && reason == "ignored-file check unavailable", "swapped directory accepted: %s", reason)
 	check(t, safetyRead(t, filepath.Join(victim, "outside.bin")) == "irreplaceable", "victim changed")
 }
+
+func TestNestedMarkerIndependentProtection(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields map[string]any
+	}{
+		{"hold", map[string]any{"holds": []any{map[string]any{"job": "busy"}}}},
+		{"job", map[string]any{"job": "busy"}},
+		{"session", map[string]any{"session": strconv.Itoa(os.Getpid())}},
+		{"ttl", map[string]any{"ttl": "99d"}},
+		{"move", map[string]any{"move_to": "archive"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			outer := e.make(t, "outer", 30*day, nil, nil)
+			nested := e.make(t, "outer/deep/inner", 30*day, nil, tc.fields)
+			v := safetyEval(e, outer)
+			check(t, !v.Safe && strings.Contains(v.Reason, "nested marker") && exists(nested), "%s", debugVerdict(v))
+		})
+	}
+}
+func TestNestedMarkerCaseVariantsProtectAncestor(t *testing.T) {
+	for _, name := range []string{".reclaimable", ".RECLAIMABLE", ".ReClAiMaBlE"} {
+		t.Run(name, func(t *testing.T) {
+			e := newTestEnv(t)
+			outer := e.make(t, "outer", 30*day, nil, nil)
+			nested := e.make(t, "outer/a/b/inner", 30*day, nil, map[string]any{"holds": []any{map[string]any{"job": "busy"}}})
+			must(t, os.Rename(filepath.Join(nested, markerName), filepath.Join(nested, name)))
+			v := safetyEval(e, outer)
+			check(t, !v.Safe && strings.Contains(v.Reason, "nested marker"), "%s", debugVerdict(v))
+		})
+	}
+}
+func TestExpiredNestedMarkerCanBeRemovedWithAncestor(t *testing.T) {
+	e := newTestEnv(t)
+	outer := e.make(t, "outer", 30*day, nil, nil)
+	e.make(t, "outer/a/b/inner", 30*day, nil, nil)
+	v := safetyEval(e, outer)
+	check(t, v.Safe, "%s", debugVerdict(v))
+}
+func TestNestedMarkerUsesItsOwnHolderContext(t *testing.T) {
+	e := newTestEnv(t)
+	outer := e.make(t, "outer", 30*day, nil, nil)
+	e.make(t, "outer/inner", 30*day, nil, map[string]any{"owner": "busy-owner"})
+	e.Cfg.Holders = []map[string]any{{"command": []string{"sh", "-c", `if [ "$RECLAIMABLE_OWNER" = busy-owner ]; then echo busy; exit 0; fi; exit 1`}}}
+	v := safetyEval(e, outer)
+	check(t, !v.Safe && strings.Contains(v.Reason, "nested marker") && strings.Contains(v.Reason, "held"), "%s", debugVerdict(v))
+}
+func TestInvalidNestedMarkerFailsClosed(t *testing.T) {
+	for _, problem := range []string{"malformed", "symlink", "directory"} {
+		t.Run(problem, func(t *testing.T) {
+			e := newTestEnv(t)
+			outer := e.make(t, "outer", 30*day, nil, nil)
+			nested := e.make(t, "outer/inner", 30*day, nil, nil)
+			path := filepath.Join(nested, markerName)
+			if problem == "malformed" {
+				safetyWrite(t, path, "not json")
+			} else {
+				must(t, os.Remove(path))
+				if problem == "symlink" {
+					must(t, os.Symlink(filepath.Join(outer, markerName), path))
+				} else {
+					must(t, os.Mkdir(path, 0755))
+				}
+			}
+			v := safetyEval(e, outer)
+			check(t, !v.Safe && strings.Contains(v.Reason, "nested marker"), "%s", debugVerdict(v))
+		})
+	}
+}
+func TestNestedMarkerRecheckedBeforeAncestorRemoval(t *testing.T) {
+	for _, change := range []string{"hold", "touch"} {
+		t.Run(change, func(t *testing.T) {
+			e := newTestEnv(t)
+			outer := e.make(t, "outer", 30*day, nil, nil)
+			nested := e.make(t, "outer/inner", 30*day, nil, nil)
+			v := safetyEval(e, outer)
+			check(t, v.Safe, "%s", debugVerdict(v))
+			if change == "hold" {
+				m, err := e.A.readMarker(nested)
+				must(t, err)
+				m.Holds = []map[string]any{{"job": "busy"}}
+				must(t, e.A.writeMarker(m))
+			} else {
+				stamp := time.Now()
+				must(t, os.Chtimes(filepath.Join(nested, markerName), stamp, stamp))
+			}
+			ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg, true)
+			check(t, !ok && strings.Contains(detail, "nested marker") && exists(outer) && exists(nested), "%v %s", ok, detail)
+		})
+	}
+}
+func TestOuterIgnoredOkDoesNotOverrideNestedMarker(t *testing.T) {
+	e := newTestEnv(t)
+	main := makeRepoWithRemote(t, e)
+	outer := e.make(t, "outer", 30*day, nil, map[string]any{"ignored_ok": true})
+	nested := filepath.Join(outer, "wt")
+	gitTest(t, main, "worktree", "add", "-q", "--detach", nested)
+	safetyWrite(t, filepath.Join(nested, ".gitignore"), "private.bin\n")
+	gitTest(t, nested, "add", ".gitignore")
+	gitTest(t, nested, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "ignore")
+	gitTest(t, nested, "push", "-q", "origin", "HEAD:refs/heads/ignored")
+	safetyWrite(t, filepath.Join(nested, "private.bin"), "keep")
+	must(t, writeJSON(filepath.Join(nested, markerName), map[string]any{"owner": "t", "regenerate": "r", "ignored_ok": false}))
+	removalAge(t, nested, 30*day)
+	v := safetyEval(e, outer)
+	check(t, !v.Safe && strings.Contains(v.Reason, "ignored_ok"), "%s", debugVerdict(v))
+}
+func TestNestedMarkerFinalCopyRecheckKeepsSource(t *testing.T) {
+	e := newTestEnv(t)
+	outer, _ := makeMovable(t, e, "scratch1")
+	nested := e.make(t, "scratch1/inner", 30*day, nil, nil)
+	v := safetyEval(e, outer)
+	check(t, v.Safe, "%s", debugVerdict(v))
+	e.A.MoveAndVerify = func(string, string, []string, map[string]string) (bool, string) {
+		m, err := e.A.readMarker(nested)
+		must(t, err)
+		m.Holds = []map[string]any{{"job": "busy"}}
+		must(t, e.A.writeMarker(m))
+		return true, "copied fixture"
+	}
+	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
+	check(t, !ok && strings.Contains(detail, "nested marker") && strings.Contains(detail, "held") && exists(outer) && exists(nested), "%v %s", ok, detail)
+}
+func TestNestedMarkerOwnDenyExactKeepsAncestor(t *testing.T) {
+	e := newTestEnv(t)
+	outer := e.make(t, "outer", 30*day, nil, nil)
+	nested := e.make(t, "outer/inner", 30*day, nil, nil)
+	e.Cfg.DenyExact = append(e.Cfg.DenyExact, nested)
+	v := safetyEval(e, outer)
+	check(t, !v.Safe && strings.Contains(v.Reason, "nested marker") && strings.Contains(v.Reason, "broad folder"), "%s", debugVerdict(v))
+}
+func TestNestedMarkerIgnoredOkIndependentAndInherited(t *testing.T) {
+	e := newTestEnv(t)
+	outer := e.make(t, "outer", 30*day, nil, map[string]any{"ignored_ok": true})
+	nested := e.make(t, "outer/inner", 30*day, nil, map[string]any{"ignored_ok": false})
+	repo := filepath.Join(nested, "wt")
+	safetyWrite(t, filepath.Join(repo, ".git"), "gitdir: fixture")
+	e.A.RepoState = func(path string) (string, string) {
+		if path == repo {
+			return "git-linked", ""
+		}
+		return "", ""
+	}
+	e.A.Run = func([]string, float64, string, []string) Result { return Result{Code: 0, Stdout: "!! private.bin\n"} }
+	v := safetyEval(e, outer)
+	check(t, !v.Safe, "nested own ignored_ok false overridden")
+	must(t, os.Remove(filepath.Join(nested, markerName)))
+	v = safetyEval(e, outer)
+	check(t, v.Safe, "unmarked nested repo did not inherit ignored_ok: %s", debugVerdict(v))
+}
+
+func TestPinnedWalkDoesNotConsumeCallerDirectory(t *testing.T) {
+	e := newTestEnv(t)
+	f := e.make(t, "pinned-walk", 30*day, map[string][]byte{"sub/data.bin": []byte("safe")}, nil)
+	root, err := openPathDir(f)
+	must(t, err)
+	defer root.Close()
+	for i := 0; i < 2; i++ {
+		w := e.A.walkAt(root, f, e.Cfg, true, 300)
+		check(t, w.Problem == "" && w.Size != nil && w.Files >= 3, "pinned walk %d failed: %+v", i, w)
+	}
+	entries, err := root.ReadDir(-1)
+	must(t, err)
+	check(t, len(entries) == 2, "walk consumed caller directory offset: %v", entries)
+}
+
+func TestNestedMarkerDirectoryReplacementAfterWalkIsRefused(t *testing.T) {
+	e := newTestEnv(t)
+	outer := e.make(t, "outer", 30*day, nil, nil)
+	nested := e.make(t, "outer/inner", 30*day, nil, nil)
+	w := e.A.walk(outer, e.Cfg, true, 300)
+	check(t, w.Problem == "" && len(w.Markers) == 1, "initial nested walk failed: %+v", w)
+	m, err := e.A.readMarker(outer)
+	must(t, err)
+	must(t, os.Rename(nested, nested+"-saved"))
+	e.make(t, "outer/inner", 30*day, nil, nil)
+	reason, _ := e.A.treeProblem(outer, m, e.Cfg, w)
+	check(t, strings.Contains(reason, "nested marker") && strings.Contains(reason, "directory changed"), "replacement marker directory accepted: %s", reason)
+	check(t, exists(nested) && exists(nested+"-saved"), "fixture directory removed")
+}

@@ -62,6 +62,12 @@ func TestCLIParity(t *testing.T) {
 		{"fresh_job_after_copy", []parityStep{{args: []string{"mark", "$HOME/data/job", "-o", "tool", "-r", "r", "-j", "flip-after", "-k", "scratch", "-m", "$HOME/archive", "-t", "1d"}, age: "data/job"}, {args: []string{"arm"}}, {args: []string{"sweep", "-AS"}}, {args: []string{"ls", "-j"}}}},
 		{"job_reclosed_before_remove", []parityStep{{args: []string{"mark", "$HOME/data/job", "-o", "tool", "-r", "r", "-j", "reclose-before", "-t", "1d"}, age: "data/job"}, {args: []string{"arm"}}, {args: []string{"sweep", "-AS"}}}},
 		{"job_reclosed_after_copy", []parityStep{{args: []string{"mark", "$HOME/data/job", "-o", "tool", "-r", "r", "-j", "reclose-after", "-k", "scratch", "-m", "$HOME/archive", "-t", "1d"}, age: "data/job"}, {args: []string{"arm"}}, {args: []string{"sweep", "-AS"}}}},
+		{"nested_fresh", []parityStep{{args: []string{"mark", "$HOME/data/outer", "-o", "tool", "-r", "r", "-t", "0s"}}, {args: []string{"mark", "$HOME/data/outer/inner", "-o", "tool", "-r", "r", "-t", "1d"}}, {args: []string{"ls", "-jS"}}, {args: []string{"sweep", "-nS"}}}},
+		{"nested_held", []parityStep{{args: []string{"mark", "$HOME/data/outer", "-o", "tool", "-r", "r", "-t", "0s"}}, {args: []string{"mark", "$HOME/data/outer/inner", "-o", "tool", "-r", "r", "-t", "0s"}}, {args: []string{"hold", "$HOME/data/outer/inner", "reader"}}, {args: []string{"arm"}}, {args: []string{"sweep", "-AS"}}}},
+		{"nested_move", []parityStep{{args: []string{"mark", "$HOME/data/outer", "-o", "tool", "-r", "r", "-t", "0s"}}, {args: []string{"mark", "$HOME/data/outer/inner", "-o", "tool", "-r", "r", "-t", "0s", "-m", "$HOME/archive"}}, {args: []string{"ls", "-jS"}}}},
+		{"data_alias_glob", []parityStep{{args: []string{"ls", "/sYsTeM/vOlUmEs/dAtA$HOME/data", "-jS"}}, {args: []string{"mark", "/system/volumes/data$HOME/data/bucket", "-o", "tool", "-r", "r"}}}},
+		{"data_alias_names", []parityStep{{args: []string{"mark", "/sYsTeM/vOlUmEs/dAtA$HOME/data/SENSITIVE", "-o", "tool", "-r", "r"}}, {args: []string{"mark", "/ſystem/Volumes/Data$HOME/data/café", "-o", "tool", "-r", "r"}}}},
+		{"remote_move", []parityStep{{args: []string{"mark", "$HOME/data/move", "-o", "tool", "-r", "r", "-t", "1d", "-m", "fixture:$HOME/archive"}, age: "data/move"}, {args: []string{"arm"}}, {args: []string{"sweep", "-AS"}}}},
 		{"case_and_normalisation", []parityStep{{args: []string{"mark", "$HOME/documents", "-o", "tool", "-r", "r"}}, {args: []string{"mark", "$HOME/data/Pics.PHOTOSLIBRARY", "-o", "tool", "-r", "r"}}, {args: []string{"mark", "$HOME/data/SENSITIVE", "-o", "tool", "-r", "r"}}, {args: []string{"mark", "$HOME/data/café", "-o", "tool", "-r", "r"}}}},
 		{"invalid_marker", []parityStep{{args: []string{"ls", "-jS"}}}},
 		{"ignored_worktree", []parityStep{{args: []string{"ls", "-jS"}}, {args: []string{"ls", "-jS"}, ignored: true}}},
@@ -125,6 +131,28 @@ esac
 `), 0755))
 				cfg := fmt.Sprintf("floor_gb = 0\ntarget_gb = 0\nroots = [%q]\ndeny_names = [\"sensitive\", \"保護[α-ω]\", \"café\"]\ndeny = [%q]\nsession_grace = \"3d\"\n[job_done]\ncommand = [%q, \"{job}\"]\n", filepath.Join(s.home, "data"), filepath.Join(s.home, "data/blocked"), helper)
 				must(t, os.WriteFile(filepath.Join(s.home, ".config/reclaimable/config.toml"), []byte(cfg), 0600))
+			}
+			if sc.name == "remote_move" {
+				for _, side := range sides {
+					path := filepath.Join(side.home, ".config/reclaimable/config.toml")
+					body, err := os.ReadFile(path)
+					must(t, err)
+					body = append([]byte("remote_command = [\"sh\", \"-c\", \"{script}\"]\n"), body...)
+					must(t, os.WriteFile(path, body, 0600))
+				}
+			}
+			if sc.name == "data_alias_glob" {
+				for _, side := range sides {
+					f := filepath.Join(side.home, "data/bucket")
+					must(t, writeJSON(filepath.Join(f, markerName), map[string]any{"owner": "tool", "regenerate": "r", "ttl": "0s"}))
+					must(t, os.MkdirAll(filepath.Join(f, "models"), 0755))
+					must(t, os.WriteFile(filepath.Join(f, "models/weights"), []byte("keep"), 0600))
+					config := filepath.Join(side.home, ".config/reclaimable/config.toml")
+					body, err := os.ReadFile(config)
+					must(t, err)
+					body = []byte(strings.Replace(string(body), "deny = [", fmt.Sprintf("deny = [%q, ", filepath.Join(side.home, "data/*/models")), 1))
+					must(t, os.WriteFile(config, body, 0600))
+				}
 			}
 			if sc.name == "ignored_worktree" {
 				for _, side := range sides {
