@@ -197,7 +197,7 @@ func (a *App) expand(p string) string {
 	if err != nil {
 		return p
 	}
-	return absolute
+	return stripData(absolute)
 }
 
 func (a *App) resolveFolder(p string) string {

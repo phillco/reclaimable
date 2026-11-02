@@ -110,7 +110,7 @@ func (a *App) expandDirs(pattern string) ([]string, error) {
 					return nil, err
 				}
 				for _, e := range entries {
-					if globMatch(e.Name(), part) {
+					if pmatch(e.Name(), part) {
 						next = append(next, filepath.Join(base, e.Name()))
 					}
 				}
@@ -587,6 +587,72 @@ func (a *App) repoState(folder string) (string, string) {
 	}
 	return "", ""
 }
+
+// ignoredFiles checks data omitted by repository cleanliness commands. Only the
+// owner's explicit ignored_ok boolean attestation may bypass this check.
+func (a *App) ignoredFiles(folder, repo string) string {
+	if strings.HasPrefix(repo, "git") {
+		r := a.Run([]string{"git", "-C", folder, "status", "--porcelain", "--ignored"}, 120, "", nil)
+		if unavailable(r) {
+			return "ignored-file check unavailable"
+		}
+		if r.Code != 0 {
+			return "git status --ignored failed"
+		}
+		for _, line := range strings.Split(r.Stdout, "\n") {
+			if strings.HasPrefix(line, "!! ") && strings.TrimRight(line[3:], "/") != markerName {
+				return "contains ignored files; marker lacks ignored_ok (" + line[3:] + ")"
+			}
+		}
+		return ""
+	}
+	r := a.Run([]string{"jj", "--ignore-working-copy", "file", "list"}, 120, folder, nil)
+	if unavailable(r) {
+		return "ignored-file check unavailable"
+	}
+	if r.Code != 0 {
+		return "jj file list failed"
+	}
+	tracked := map[string]bool{}
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		tracked[line] = true
+	}
+	hidden := ""
+	err := filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == folder {
+			return nil
+		}
+		if d.IsDir() {
+			if filepath.Dir(path) == folder && (d.Name() == ".jj" || d.Name() == ".git") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			// os.walk lists a directory symlink among dirs and does not follow it.
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				return nil
+			}
+		}
+		rel, err := filepath.Rel(folder, path)
+		if err != nil {
+			return err
+		}
+		if rel != markerName && !tracked[rel] {
+			hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return "ignored-file check unavailable"
+	}
+	return hidden
+}
+
 func sortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -605,8 +671,10 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 	}
 	dev := device(root)
 	deadline := time.Now().Add(time.Duration(limit * float64(time.Second)))
+	protected := a.protectedIdentities(cfg)
 	stack := []string{folder}
 	repos := map[string]bool{}
+	seen := map[[2]uint64]bool{}
 	patterns := make([]string, len(cfg.DenyPaths))
 	for i, p := range cfg.DenyPaths {
 		patterns[i] = a.expand(p)
@@ -633,8 +701,20 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 				w.Repos = sortedKeys(repos)
 				return w
 			}
-			size += allocated(st)
 			w.Files++
+			hardlinked := false
+			if stat, ok := st.Sys().(*syscall.Stat_t); ok {
+				hardlinked = stat.Nlink > 1 && !st.IsDir()
+			}
+			if hardlinked {
+				key := [2]uint64{device(st), inode(st)}
+				if !seen[key] {
+					seen[key] = true
+					size += allocated(st)
+				}
+			} else {
+				size += allocated(st)
+			}
 			rel, _ := filepath.Rel(folder, p)
 			absolute, err := filepath.Abs(p)
 			if err != nil {
@@ -642,19 +722,24 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) W
 				w.Repos = sortedKeys(repos)
 				return w
 			}
+			hitPath := false
 			for _, pattern := range patterns {
-				if globMatch(p, pattern) || globMatch(absolute, pattern) {
-					w.Problem = "contains deny-listed " + rel
-					w.Repos = sortedKeys(repos)
-					return w
+				if pmatch(p, pattern) || pmatch(absolute, pattern) {
+					hitPath = true
+					break
 				}
+			}
+			if hitPath || protected[FileIdentity{device(st), inode(st)}] {
+				w.Problem = "contains deny-listed " + rel
+				w.Repos = sortedKeys(repos)
+				return w
 			}
 			if checkNames && denyNameHit(strings.Split(rel, string(filepath.Separator)), cfg) != "" {
 				w.Problem = "contains deny-listed " + rel
 				w.Repos = sortedKeys(repos)
 				return w
 			}
-			if (e.Name() == ".git" || e.Name() == ".jj") && d != folder {
+			if (fold(e.Name()) == ".git" || fold(e.Name()) == ".jj") && d != folder {
 				repos[d] = true
 			}
 			if st.IsDir() {
@@ -726,6 +811,12 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 	if m.effectiveKind() == "worktree" && repo == "" {
 		return "kind worktree but no .git/.jj found", repo
 	}
+	ignoredOK, _ := m.Extra["ignored_ok"].(bool)
+	if repo != "" && !ignoredOK {
+		if hidden := a.ignoredFiles(folder, repo); hidden != "" {
+			return hidden, repo
+		}
+	}
 	for i, nested := range w.Repos {
 		if i >= 20 {
 			break
@@ -734,6 +825,11 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 		rel, _ := filepath.Rel(folder, nested)
 		if problem != "" {
 			return "nested repo " + rel + " " + problem, repo
+		}
+		if (kind == "git-linked" || kind == "jj-secondary") && !ignoredOK {
+			if hidden := a.ignoredFiles(nested, kind); hidden != "" {
+				return "nested repo " + rel + " " + hidden, repo
+			}
 		}
 		if kind == "git-primary" || kind == "jj-primary" {
 			return "nested " + kind + " repository " + rel + " (only linked worktrees / secondary workspaces are removable)", repo

@@ -377,6 +377,15 @@ func (a *App) readMarker(folder string) (*Marker, error) {
 	if !ok || strings.TrimSpace(owner) == "" {
 		return nil, errors.New("marker needs an owner")
 	}
+	regenerate, ok := data["regenerate"].(string)
+	if !ok || strings.TrimSpace(regenerate) == "" {
+		return nil, errors.New("marker needs a regenerate description")
+	}
+	if value, exists := data["ignored_ok"]; exists {
+		if _, ok := value.(bool); !ok {
+			return nil, errors.New("ignored_ok must be true or false")
+		}
+	}
 	kind := ""
 	if data["kind"] != nil {
 		var ok bool
@@ -415,10 +424,6 @@ func (a *App) readMarker(folder string) (*Marker, error) {
 		if !contains([]string{"owner", "ttl", "regenerate", "kind", "job", "session", "move_to", "holds"}, k) {
 			extra[k] = v
 		}
-	}
-	regenerate := ""
-	if truth(data["regenerate"]) {
-		regenerate = textValue(data["regenerate"])
 	}
 	return &Marker{Folder: folder, Owner: owner, TTL: ttl, Regenerate: regenerate, Kind: kind, Job: textValue(data["job"]), JobPresent: data["job"] != nil, Session: textValue(data["session"]), MoveTo: textValue(data["move_to"]), Holds: holds, Mtime: float64(st.ModTime().UnixNano()) / 1e9, Extra: extra}, nil
 }
@@ -572,17 +577,59 @@ func ancestors(p string) []string {
 	}
 	return out
 }
+
+const dataVolume = "/System/Volumes/Data"
+
+type FileIdentity struct{ Dev, Ino uint64 }
+
+func stripData(path string) string {
+	if path == dataVolume {
+		return "/"
+	}
+	if strings.HasPrefix(path, dataVolume+"/") {
+		return path[len(dataVolume):]
+	}
+	return path
+}
+func pmatch(name, pattern string) bool { return globMatch(fold(name), fold(pattern)) }
+func identity(path string) (FileIdentity, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return FileIdentity{}, false
+	}
+	return FileIdentity{device(info), inode(info)}, true
+}
+func (a *App) protectedIdentities(cfg *Config) map[FileIdentity]bool {
+	out := map[FileIdentity]bool{}
+	for _, raw := range cfg.DenyPaths {
+		p := a.expand(raw)
+		if !strings.ContainsAny(p, "*?[") {
+			if id, ok := identity(p); ok {
+				out[id] = true
+			}
+		}
+	}
+	return out
+}
 func denyNameHit(parts []string, cfg *Config) string {
 	for _, part := range parts {
 		for _, pat := range cfg.DenyNames {
-			if globMatch(part, pat) {
+			if pmatch(part, pat) {
 				return part
 			}
 		}
 	}
+	folded := make([]string, len(parts))
+	for i, p := range parts {
+		folded[i] = fold(p)
+	}
 	for _, seq := range cfg.DenySequences {
-		for i := 0; i+len(seq) <= len(parts); i++ {
-			if reflect.DeepEqual(parts[i:i+len(seq)], seq) {
+		want := make([]string, len(seq))
+		for i, p := range seq {
+			want[i] = fold(p)
+		}
+		for i := 0; i+len(want) <= len(folded); i++ {
+			if reflect.DeepEqual(folded[i:i+len(want)], want) {
 				return strings.Join(seq, "/")
 			}
 		}
@@ -601,38 +648,70 @@ func (a *App) denyReason(path string, cfg *Config) string {
 	if e != nil {
 		real = path
 	}
-	real, _ = filepath.Abs(real)
+	real = a.expand(real)
+	protected := a.protectedIdentities(cfg)
 	candidates := []string{path}
 	if real != path {
 		candidates = append(candidates, real)
 	}
 	for _, candidate := range candidates {
+		chain := ancestors(candidate)
+		type identified struct {
+			id FileIdentity
+			ok bool
+		}
+		ids := make([]identified, len(chain))
+		for i, p := range chain {
+			ids[i].id, ids[i].ok = identity(p)
+		}
+		cand := ids[0]
 		for _, raw := range cfg.DenyExact {
-			if candidate == a.expand(raw) {
+			target := a.expand(raw)
+			same := fold(candidate) == fold(target)
+			if cand.ok {
+				tid, ok := identity(target)
+				same = same || ok && cand.id == tid
+			}
+			if same {
 				return "broad folder " + raw
 			}
 		}
-		if p := filepath.Dir(candidate); p == "/Users" || p == "/Volumes" {
+		if p := fold(filepath.Dir(candidate)); p == "/users" || p == "/volumes" {
 			return "home or volume root"
+		}
+		for _, id := range ids {
+			if id.ok && protected[id.id] {
+				return "deny-list (same directory as a protected path)"
+			}
 		}
 		for _, raw := range cfg.DenyPaths {
 			pattern := a.expand(raw)
-			for _, anc := range ancestors(candidate) {
-				if globMatch(anc, pattern) {
+			for _, anc := range chain {
+				if pmatch(anc, pattern) {
 					return "deny-list " + raw
 				}
 			}
-			if candidate != "/" && globMatch(pattern+"/", candidate+"/*") {
+			if candidate != "/" && pmatch(pattern+"/", candidate+"/*") {
 				return "contains deny-listed " + raw
 			}
 			base := strings.Split(pattern, "*")[0]
-			if strings.Contains(pattern, "*") && strings.HasPrefix(base, candidate+"/") {
+			if strings.Contains(pattern, "*") && strings.HasPrefix(fold(base), fold(candidate)+"/") {
 				return "may contain deny-listed " + raw
+			}
+			if !strings.ContainsAny(pattern, "*?[") && cand.ok {
+				for _, p := range ancestors(a.expand(raw)) {
+					id, ok := identity(p)
+					if ok && id == cand.id {
+						return "contains deny-listed " + raw
+					}
+				}
 			}
 		}
 		parts := pathParts(candidate)
-		if contains(parts, ".git") || contains(parts, ".jj") {
-			return "inside a .git/.jj dir"
+		for _, p := range parts {
+			if fold(p) == ".git" || fold(p) == ".jj" {
+				return "inside a .git/.jj dir"
+			}
 		}
 		if hit := denyNameHit(parts, cfg); hit != "" {
 			return "deny-listed name " + hit
@@ -739,7 +818,7 @@ func (a *App) scan(roots []string, cfg *Config, limit float64) (map[string]bool,
 				}
 				denied := false
 				for _, pattern := range cfg.DenyPaths {
-					if globMatch(p, a.expand(pattern)) {
+					if pmatch(p, a.expand(pattern)) {
 						denied = true
 						break
 					}
