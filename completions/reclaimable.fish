@@ -1,5 +1,5 @@
 # reclaimable Go binary: janitor for folders marked with .reclaimable
-set -l cmds mark touch hold release ls sweep status arm
+set -l cmds mark touch hold release ls sweep maintenance status arm
 complete -c reclaimable -f
 complete -c reclaimable -s h -l help -d 'Show help'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a mark -d 'Create/update a marker'
@@ -8,6 +8,7 @@ complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a hold -d 'D
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a release -d "Drop a job's hold"
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a ls -d 'List markers and eligibility'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a sweep -d 'Run the janitor'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a maintenance -d 'Run configured native cache hooks'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a status -d 'Armed state, free space, log tail'
 complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a arm -d 'Arm this host (24h grace)'
 
@@ -28,5 +29,8 @@ complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s A -l armed -d 
 complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s f -l floor -x -a '30GB 50GiB' -d 'Free-space floor'
 complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s t -l target -x -d 'Free space to reach'
 complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s v -l verbose -d 'List kept markers'
+complete -c reclaimable -n "__fish_seen_subcommand_from maintenance" -s n -l dry-run -d 'Never run cleanup commands'
+complete -c reclaimable -n "__fish_seen_subcommand_from maintenance" -s o -l only -x -d 'Configured hook name'
+complete -c reclaimable -n "__fish_seen_subcommand_from maintenance" -s f -l force-due -d 'Ignore cadence only'
 complete -c reclaimable -n "__fish_seen_subcommand_from status" -s l -l lines -x -d 'Log lines'
 complete -c reclaimable -n "__fish_seen_subcommand_from arm" -s x -l off -d 'Disarm'

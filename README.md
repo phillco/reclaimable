@@ -50,6 +50,7 @@ reclaimable hold PATH JOB [-p SUBPATH]      # never removed while any hold exist
 reclaimable release PATH JOB [-p SUBPATH]
 reclaimable ls [ROOTS...] [-j] [-q] [-S]    # -q skips the deep checks
 reclaimable sweep [-n | -A] [-f 30GB] [-t 50GB] [-S] [-v]
+reclaimable maintenance [-n] [-o NAME | --only NAME] [-f | --force-due]
 reclaimable status [-l N]
 reclaimable arm [-x]                        # -x disarms
 ```
@@ -234,6 +235,112 @@ exclude_list_format = "{path}"       # one line per folder; e.g. "path {path}"
 # How remote moves (move_to = "host:path") run commands on the host.
 remote_command = ["ssh", "{host}", "{script}"]
 ```
+
+## Scheduled native cache maintenance (Go only)
+
+The hourly `sweep` can also run a configured list of native cleanup commands,
+after folder removals and under the same sweep lock. No separate scheduler is
+needed for each tool. `maintenance` inspects or runs the same hooks without a
+marker scan or folder removal:
+
+```sh
+reclaimable maintenance -n
+reclaimable maintenance --only uv --force-due
+```
+
+Hooks require both a valid host armed state past its 24-hour grace and the explicit
+config opt-in `maintenance_armed = true`. Otherwise they report a dry run.
+`sweep -n` and `maintenance -n` never run cleanup commands. `sweep -A` does not
+bypass maintenance's grace period. `--force-due` ignores only cadence; it does not
+bypass arming, free-space triggers, busy holders or in-use checks.
+
+The config's argv arrays are the allow-list: commands are never read from markers
+or other data files, substituted with marker values, or passed through a shell.
+The executable is resolved through the current PATH for each attempt; a missing
+tool is logged and skipped. Configure only trusted native commands and arguments.
+Native tools own their cleanup policy; marker TTL/deny checks do not govern what
+a configured native tool removes.
+
+Add entries like these to `config.toml` (all opt out by default):
+
+```toml
+maintenance_armed = false  # top-level; true is a separate explicit opt-in
+busy_holders = ["scheduler"]  # all maintenance hooks must pass this check
+
+[[maintenance]]
+name = "uv"
+command = ["uv", "cache", "prune"]
+every = "24h"
+when_free_below = "80GB"  # optional; free space on the home volume, strictly below
+timeout = "20m"          # optional; default 20m, must be a positive duration
+in_use = { lockfiles = ["~/.cache/uv/.lock"], lsof = ["~/.cache/uv"], processes = ["uv"] }
+
+[[maintenance]]
+name = "npm"
+command = ["npm", "cache", "verify"]
+every = "24h"
+in_use = { lsof = ["~/.npm"], processes = ["npm"] }
+
+[[maintenance]]
+name = "pnpm"
+command = ["pnpm", "store", "prune"]
+every = "24h"
+in_use = { processes = ["pnpm"] }
+
+[[maintenance]]
+name = "brew"
+command = ["brew", "cleanup"]
+every = "7d"
+in_use = { processes = ["brew"] }
+
+[[maintenance]]
+name = "docker-dangling"
+command = ["docker", "image", "prune", "-f", "--filter", "dangling=true"]
+every = "24h"
+in_use = { processes = ["docker"] }
+
+[[holder]]
+name = "scheduler"
+command = ["/usr/local/bin/cleanup-busy"]
+timeout = 30             # holder timeouts are seconds
+# exit 0 = busy, 1 = idle; all other results/errors/timeouts skip cleanup
+
+[hosts.worker]
+maintenance_armed = false
+maintenance = []         # replaces the global list; [] disables all hooks here
+```
+
+Host sections may override `maintenance_armed` and replace the entire
+`maintenance` list, using `[[hosts.worker.maintenance]]` for host entries. Names
+must be unique within the effective host list. Cache locations vary by tool and
+host; declare the paths and exact process names used there. The Docker example
+prunes dangling images only; it does not prune containers, volumes or all unused
+images. No example command is executed by installing or building this tool.
+
+Any declared lockfile's existence (including a stale file or dangling symlink)
+skips cleanup. An error checking a lockfile also skips it. `lsof +D` must return
+an unambiguous no-match for each existing declared directory, and `pgrep -x` must
+report no process with the exact declared name. Missing probes, unreadable paths,
+warnings, failures and timeouts skip the hook. These checks are snapshots; native
+tools must still implement their own concurrency protection.
+
+`busy_holders` references uniquely named command `[[holder]]` entries. A top-level
+list applies to every hook; a hook's own list adds checks. Host sections can
+replace the top-level list. Each referenced command is
+checked immediately before an eligible attempt; only exit 1 permits cleanup.
+For these checks the holder's path/folder is home, owner is the hook name, kind is
+`cache`, and job/session are empty. Existing folder-holder behavior is unchanged.
+
+Attempts, including failed/timed-out attempts, consume cadence. Their start times
+and outcomes live in `maintenance.json` in the state directory; skipped and dry
+runs do not consume cadence. Malformed/unreadable state prevents execution. Each
+timeout kills the command's process group, and remaining group members are killed
+when the command returns. Hook outcomes go to the existing log and the
+`maintenance` array in `last-sweep.json`, including elapsed seconds, exit status,
+timeout status, home-volume free bytes before/after and their signed difference
+in bytes and decimal GB. Other disk activity can affect that measured difference.
+A manual run updates that array while preserving the prior folder-sweep report.
+A command failure returns a nonzero exit; skipped hooks return success.
 
 ## Build and tests
 

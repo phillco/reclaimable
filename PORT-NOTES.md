@@ -8,6 +8,10 @@ tests. No binary is committed.
 
 ## Deviations
 
+- Scheduled native cache-maintenance hooks and the `maintenance` command are a
+  Go-only addition, with no Python counterpart. They use config-only argv,
+  independent opt-in/cadence and the sweep lock; fake-command tests cover guards,
+  timeouts, arming and measured space reports. The Python snapshots stay frozen.
 - Go 1.22+, one vendored library: `github.com/BurntSushi/toml` v1.4.0. Generated
   Unicode data is pinned to 16.0.0 and has its included license; another Python
   Unicode database can differ for newly assigned characters.
