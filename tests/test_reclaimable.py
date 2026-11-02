@@ -1340,6 +1340,27 @@ def test_pressure_sweep_stops_when_real_free_space_reaches_target(env, monkeypat
     )
 
 
+def test_pressure_sweep_continues_when_estimate_overstates_reclaimed_space(
+    env, monkeypatch
+):
+    folders = [
+        make(env, name, age_s=(10 - i) * 3600, ttl="3d")
+        for i, name in enumerate(("oldest", "middle", "newest"))
+    ]
+    monkeypatch.setattr(rc, "HOME", env.root)
+    env.cfg.floor, env.cfg.target = 100, 300
+    monkeypatch.setattr(rc, "armed_state", lambda: (True, "armed fixture"))
+    monkeypatch.setattr(
+        rc,
+        "free_bytes",
+        lambda path: 300 if sum(not f.exists() for f in folders) >= 2 else 0,
+    )
+    # Each allocation estimate exceeds the target; actual reclaim needs two.
+    rc.sweep(sweep_args(), env.cfg)
+    assert not folders[0].exists() and not folders[1].exists()
+    assert folders[2].exists()
+
+
 def ignore_in_main(main, pattern):
     exclude = main / ".git/info/exclude"
     exclude.parent.mkdir(exist_ok=True)

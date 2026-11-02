@@ -159,7 +159,8 @@ even before their TTL, until the target. Default floor 30 GB, target floor + 20 
 only the home volume has a floor unless `volume_floors` names others.
 Sizes count each hardlinked file once. The floor plan is an estimate: when armed,
 the sweep re-measures real free space before every pressure removal and stops at
-the target (or when the sizes already removed reach it).
+the target. An optimistic size estimate cannot stop an armed sweep early; later
+safe candidates remain in LRU order until measured free space reaches the target.
 
 ## Configuration
 

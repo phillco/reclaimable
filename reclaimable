@@ -2391,7 +2391,9 @@ def volume_limits(folder: Path, cfg: Config) -> tuple[int, int] | None:
     return floor, (cfg.target if dev == home_dev else floor + TARGET_MARGIN)
 
 
-def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
+def plan(
+    verdicts: list[Verdict], cfg: Config, *, estimate: bool = True
+) -> list[tuple[Verdict, str]]:
     """Expired + safe always; then, per volume under its floor, safe ones LRU-first until target."""
     chosen = [(v, "ttl expired") for v in verdicts if v.safe and v.expired]
     picked = {id(v) for v, _ in chosen}
@@ -2412,11 +2414,12 @@ def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
             continue
         target = cfg.target if dev == home_dev else floor + TARGET_MARGIN
         free = free_bytes(group[0].folder)
-        free += sum(v.size or 0 for v, _ in chosen if v.folder.stat().st_dev == dev)
+        if estimate:
+            free += sum(v.size or 0 for v, _ in chosen if v.folder.stat().st_dev == dev)
         if free >= floor:
             continue
         for v in sorted(group, key=lambda x: x.last_used):
-            if free >= target:
+            if estimate and free >= target:
                 break
             if v.safe and id(v) not in picked and v.size:
                 chosen.append(
@@ -2426,7 +2429,8 @@ def plan(verdicts: list[Verdict], cfg: Config) -> list[tuple[Verdict, str]]:
                     )
                 )
                 picked.add(id(v))
-                free += v.size
+                if estimate:
+                    free += v.size
     return chosen
 
 
@@ -2452,28 +2456,23 @@ def sweep(args, cfg: Config) -> int:
         reg = load_registry()
         folders = discover(cfg, reg, force_scan=args.scan)
         verdicts = [evaluate(f, cfg, reg) for f in folders]
-        actions = plan(verdicts, cfg)
+        # Dry-run estimates are bounded by sizes. Real sweeps retain later LRU
+        # candidates until a fresh free-space measurement reaches the target.
+        actions = plan(verdicts, cfg, estimate=not armed)
         done = []
         acted = set()
-        freed_on: dict[int, int] = {}  # estimated bytes removed per device this sweep
-        start_free: dict[int, int] = {}
         for v, why in actions:
             acted.add(id(v))
             m = v.marker
             verb = "move" if v.action == "move" else "delete"
             pressure = why.startswith("low space")
-            dev = None
             if armed and pressure:
-                # Pressure removals stop once real free space (and the sizes freed so
-                # far) reach the target; the plan was only an estimate.
+                # Allocation estimates can overstate reclaim (shared extents,
+                # hardlinks); only measured free space ends pressure removal.
                 lim = volume_limits(v.folder, cfg)
-                with contextlib.suppress(OSError):
-                    dev = v.folder.stat().st_dev
-                if lim and dev is not None:
-                    start_free.setdefault(dev, free_bytes(v.folder))
+                if lim:
                     real = free_bytes(v.folder)
-                    estimated = start_free[dev] + freed_on.get(dev, 0)
-                    if max(real, 0) >= lim[1] or estimated >= lim[1]:
+                    if max(real, 0) >= lim[1]:
                         line = (
                             f"skip {v.folder}: free space target reached "
                             f"({human_bytes(real)} free >= {human_bytes(lim[1])})"
@@ -2490,8 +2489,6 @@ def sweep(args, cfg: Config) -> int:
                         )
                         continue
             ok, detail = remove_folder(v, armed, cfg, reg, floor_pressure=pressure)
-            if ok and dev is not None:
-                freed_on[dev] = freed_on.get(dev, 0) + (v.size or 0)
             line = (
                 f"{'' if armed else '[dry-run] '}{verb if ok else ('would ' + verb if not armed else verb + ' SKIPPED')} "
                 f"{v.folder} ({human_bytes(v.size)}) owner={m.owner} kind={m.effective_kind} reason={why}"
