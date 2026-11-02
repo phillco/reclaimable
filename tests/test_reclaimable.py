@@ -1307,3 +1307,33 @@ def test_marker_without_regenerate_is_invalid_and_kept(env, bad):
     del data["regenerate"]
     (g / ".reclaimable").write_text(json.dumps(data))
     assert "regenerate" in rc.evaluate(g, env.cfg, env.reg).reason
+
+
+def test_hardlinks_are_counted_once(env):
+    f = make(env, "hl", age_s=30 * DAY, files={"a.bin": b"x" * 200_000})
+    os.link(f / "a.bin", f / "b.bin")
+    os.link(f / "a.bin", f / "c.bin")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    solo = make(env, "solo", age_s=30 * DAY, files={"a.bin": b"x" * 200_000})
+    one = rc.evaluate(solo, env.cfg, env.reg)
+    assert v.size < one.size + 8192, (v.size, one.size)
+
+
+def test_pressure_sweep_stops_when_real_free_space_reaches_target(env, monkeypatch):
+    names = ["pa", "pb", "pc"]
+    folders = [
+        make(env, n, age_s=(10 - i) * 3600, ttl="3d", files={"x": b"x" * 4096})
+        for i, n in enumerate(names)
+    ]
+    monkeypatch.setattr(rc, "HOME", env.root)
+    env.cfg.floor, env.cfg.target = 10**18, 10**18
+
+    def fake_free(path):
+        return 5 if all(f.exists() for f in folders) else 10**18 + 1
+
+    monkeypatch.setattr(rc, "free_bytes", fake_free)
+    rc.write_json(rc.ARMED_FILE, {"armed_at": time.time() - 2 * DAY})
+    rc.sweep(sweep_args(floor=10**18, target=10**18), env.cfg)
+    assert sum(f.exists() for f in folders) == 2, (
+        "only the oldest is removed; the plan overshoots"
+    )
