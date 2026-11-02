@@ -809,7 +809,10 @@ def lease_hold(holder: dict, marker: Marker) -> str | None:
 
 
 def _fill(arg: str, **values: str) -> str:
+    """Expand a leading `~/` and `{name}` placeholders (plus `{config_dir}`, the
+    directory holding the config file, so helper scripts can sit next to it)."""
     arg = str(Path(arg).expanduser()) if arg.startswith("~/") else arg
+    arg = arg.replace("{config_dir}", str(CONFIG_FILE.resolve().parent))
     for key, value in values.items():
         arg = arg.replace("{" + key + "}", value)
     return arg

@@ -381,6 +381,17 @@ def test_command_holder_timeout_and_missing_fail_closed(env):
     assert not rc.evaluate(f, env.cfg, env.reg).safe
 
 
+def test_config_dir_placeholder(env):
+    f = make(env, "h", age_s=9 * DAY)
+    (env.root / "config").mkdir(exist_ok=True)
+    rc.CONFIG_FILE.write_text("")
+    helper = rc.CONFIG_FILE.parent / "veto"
+    helper.write_text("#!/bin/sh\nexit 0\n")
+    helper.chmod(0o755)
+    env.cfg.holders = [{"command": ["{config_dir}/veto"]}]
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+
+
 def test_open_files_block(env, monkeypatch):
     f = make(env, "busy", age_s=9 * DAY)
     monkeypatch.setattr(rc, "open_files", lambda folder: "open files: python[1]")

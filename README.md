@@ -131,7 +131,8 @@ timeout = 30
 # exit 0 = held, 1 = free, anything else (or a timeout / failure to run) = held.
 # Placeholders: {path} ({folder}), {owner}, {job}, {session}, {kind};
 # the same values are in RECLAIMABLE_PATH, _FOLDER, _OWNER, _JOB, _SESSION, _KIND.
-# The first stdout line becomes the reason.
+# The first stdout line becomes the reason. {config_dir} is the directory of this file,
+# so helper scripts can live beside it. A leading "~/" in an argument is expanded.
 
 [[holder]]
 lease_dir = ["~/.local/state/leases", "/home/*/.local/state/leases"]  # paths or globs
