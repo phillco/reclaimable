@@ -1,0 +1,32 @@
+# reclaimable: janitor for folders marked with .reclaimable
+set -l cmds mark touch hold release ls sweep status arm
+complete -c reclaimable -f
+complete -c reclaimable -s h -l help -d 'Show help'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a mark -d 'Create/update a marker'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a touch -d 'Mark folders used now'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a hold -d 'Declare a job is reading a folder'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a release -d "Drop a job's hold"
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a ls -d 'List markers and eligibility'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a sweep -d 'Run the janitor'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a status -d 'Armed state, free space, log tail'
+complete -c reclaimable -n "not __fish_seen_subcommand_from $cmds" -a arm -d 'Arm this host (24h grace)'
+
+complete -c reclaimable -n "__fish_seen_subcommand_from mark touch hold release ls" -F -a "(__fish_complete_directories)"
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s o -l owner -x -d 'Owning tool or job'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s t -l ttl -x -a '1h 24h 2d 3d 7d' -d 'Time to live'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s r -l regen -x -d 'How it comes back'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s k -l kind -x -a 'cache scratch worktree mirror staged' -d 'Kind'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s j -l job -x -d 'Job id for job-tied data'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s s -l session -x -d 'Session id or pid'
+complete -c reclaimable -n "__fish_seen_subcommand_from mark" -s m -l move-to -r -d 'Move destination (path or host:path)'
+complete -c reclaimable -n "__fish_seen_subcommand_from hold release" -s p -l path -r -d 'Path inside the folder'
+complete -c reclaimable -n "__fish_seen_subcommand_from ls" -s j -l json -d 'JSON output'
+complete -c reclaimable -n "__fish_seen_subcommand_from ls" -s q -l quick -d 'Skip deep checks'
+complete -c reclaimable -n "__fish_seen_subcommand_from ls sweep" -s S -l scan -d 'Rescan roots first'
+complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s n -l dry-run -d 'Never remove anything'
+complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s A -l armed -d 'Act now (host must be armed)'
+complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s f -l floor -x -a '30GB 50GiB' -d 'Free-space floor'
+complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s t -l target -x -d 'Free space to reach'
+complete -c reclaimable -n "__fish_seen_subcommand_from sweep" -s v -l verbose -d 'List kept markers'
+complete -c reclaimable -n "__fish_seen_subcommand_from status" -s l -l lines -x -d 'Log lines'
+complete -c reclaimable -n "__fish_seen_subcommand_from arm" -s x -l off -d 'Disarm'

@@ -1,0 +1,23 @@
+[project]
+name = "reclaimable"
+version = "0.1.0"
+description = "Janitor for regenerable folders marked with a .reclaimable file"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+[project.scripts]
+reclaimable = "reclaimable_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["reclaimable_cli.py"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"reclaimable" = "reclaimable_cli.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
