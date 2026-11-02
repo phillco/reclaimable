@@ -975,3 +975,78 @@ def test_session_grace_config_parsing(tmp_path):
     p.write_text('session_grace = "soon"\n')
     with pytest.raises(ValueError):
         _fresh().load_config(p)
+
+
+# --- repo state is re-checked right before removal ------------------------------
+
+
+def linked_worktree(env, rel="wt2"):
+    main = make_repo_with_remote(env)
+    wt = env.root / "data" / rel
+    git("worktree", "add", "-q", "--detach", str(wt), cwd=main)
+    (wt / ".reclaimable").write_text(
+        json.dumps({"owner": "t", "regenerate": "git worktree add", "kind": "worktree"})
+    )
+    old = time.time() - 30 * DAY
+    os.utime(wt / ".reclaimable", (old, old))
+    return main, wt
+
+
+def test_dirty_file_added_after_evaluation_blocks_removal(env):
+    main, wt = linked_worktree(env)
+    v = rc.evaluate(wt, env.cfg, env.reg)
+    assert v.safe and v.repo == "git-linked", v.reason
+    (wt / "uncommitted.txt").write_text("precious")
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "dirty" in detail
+    assert (wt / "uncommitted.txt").read_text() == "precious"
+
+
+def test_unpushed_commit_after_evaluation_blocks_removal(env):
+    main, wt = linked_worktree(env, "wt3")
+    v = rc.evaluate(wt, env.cfg, env.reg)
+    assert v.safe, v.reason
+    (wt / "c").write_text("1")
+    git("add", "c", cwd=wt)
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c", cwd=wt)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "unpushed" in detail and wt.exists()
+
+
+def test_nested_repo_dirtied_after_evaluation_blocks_removal(env):
+    main = make_repo_with_remote(env)
+    f = make(env, "mir4", age_s=30 * DAY, kind="mirror")
+    git("worktree", "add", "-q", "--detach", str(f / "wt"), cwd=main)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe, v.reason
+    (f / "wt/new.txt").write_text("x")
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and "nested repo wt" in detail and (f / "wt/new.txt").exists()
+
+
+def test_dirty_file_added_during_move_keeps_source(env, monkeypatch):
+    main, wt = linked_worktree(env, "wt5")
+    rc.write_json(
+        wt / ".reclaimable",
+        {
+            "owner": "t",
+            "regenerate": "r",
+            "kind": "worktree",
+            "move_to": str(env.root / "arch"),
+        },
+    )
+    old = time.time() - 30 * DAY
+    os.utime(wt / ".reclaimable", (old, old))
+    v = rc.evaluate(wt, env.cfg, env.reg)
+    assert v.safe and v.action == "move", v.reason
+    real = rc.move_and_verify
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        # tracked-file edit leaves the copy matching hashes only if made before; here a new file
+        (wt / "late.txt").write_text("late")
+        return out
+
+    monkeypatch.setattr(rc, "move_and_verify", slow)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and (wt / "late.txt").exists()

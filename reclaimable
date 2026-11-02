@@ -1188,6 +1188,41 @@ class Verdict:
         }
 
 
+def tree_problem(
+    folder: Path, m: Marker, cfg: Config, w: Walk
+) -> tuple[str | None, str | None]:
+    """(reason to keep, repo type) from a fresh walk: incomplete or cross-filesystem
+    walks, deny-listed content, and dirty/unpushed/primary repos (the folder itself
+    and nested ones). Shared by evaluation and the final pre-removal re-check."""
+    if w.problem:
+        return w.problem, None
+    if w.crossed:
+        return f"contains another filesystem at {w.crossed[0].relative_to(folder)}", None
+    repo, problem = repo_state(folder)
+    if problem:
+        return f"worktree {problem}", repo
+    if repo in ("git-primary", "jj-primary"):
+        return (
+            f"{repo} repository (only linked worktrees / secondary workspaces are removable)",
+            repo,
+        )
+    if m.effective_kind == "worktree" and repo is None:
+        return "kind worktree but no .git/.jj found", repo
+    for nested in w.repos[:20]:
+        nested_kind, problem = repo_state(nested)
+        if problem:
+            return f"nested repo {nested.relative_to(folder)} {problem}", repo
+        if nested_kind in ("git-primary", "jj-primary"):
+            return (
+                f"nested {nested_kind} repository {nested.relative_to(folder)} "
+                "(only linked worktrees / secondary workspaces are removable)",
+                repo,
+            )
+    if len(w.repos) > 20:
+        return f"{len(w.repos)} nested repos (too many to verify)", repo
+    return None, repo
+
+
 def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict:
     """Cheap checks first; deep=True adds the walk, lease, lsof and repo checks."""
     v = Verdict(marker=None, folder=folder)
@@ -1269,36 +1304,10 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
     if w.size is not None:
         v.size = w.size
         entry.update(size=w.size, size_at=now())
-    if w.problem:
-        v.reason = w.problem
-        return v
-    if w.crossed:
-        v.reason = f"contains another filesystem at {w.crossed[0].relative_to(folder)}"
-        return v
-    repo, problem = repo_state(folder)
+    reason, repo = tree_problem(folder, m, cfg, w)
     v.repo = repo
-    if problem:
-        v.reason = f"worktree {problem}"
-        return v
-    if repo in ("git-primary", "jj-primary"):
-        v.reason = f"{repo} repository (only linked worktrees / secondary workspaces are removable)"
-        return v
-    if m.effective_kind == "worktree" and repo is None:
-        v.reason = "kind worktree but no .git/.jj found"
-        return v
-    for nested in w.repos[:20]:
-        nested_kind, problem = repo_state(nested)
-        if problem:
-            v.reason = f"nested repo {nested.relative_to(folder)} {problem}"
-            return v
-        if nested_kind in ("git-primary", "jj-primary"):
-            v.reason = (
-                f"nested {nested_kind} repository {nested.relative_to(folder)} "
-                "(only linked worktrees / secondary workspaces are removable)"
-            )
-            return v
-    if len(w.repos) > 20:
-        v.reason = f"{len(w.repos)} nested repos (too many to verify)"
+    if reason:
+        v.reason = reason
         return v
     hold = holder_hold(m, cfg)
     if hold:
@@ -1502,6 +1511,14 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
         busy = open_files(v.folder)
         if busy:
             return busy
+        # Repeat the worktree checks: work may have been added since evaluation
+        # (or during a long copy) that the original verdict never saw.
+        w = walk(v.folder, cfg, check_names=True)
+        reason, repo = tree_problem(v.folder, fresh, cfg, w)
+        if reason:
+            return reason
+        if repo != v.repo:
+            return "repository type changed since evaluation"
         if src_hashes is not None:
             current = file_hashes(v.folder)
             current.pop(MARKER, None)
