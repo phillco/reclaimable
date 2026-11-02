@@ -92,7 +92,8 @@ applies to every kind, `mirror` included; a walk that times out or hits an unrea
 
 Immediately before removal, **under the same lock `hold` takes**, the marker is
 re-read (touched or held since evaluation means keep), and the deny-list,
-holders, open files, folder identity and the worktree checks (dirty,
+holders, open files, folder identity, a fresh `job_done` answer (the
+positive cache is bypassed; open, unknown or error keeps the folder) and the worktree checks (dirty,
 unpushed, primary or nested repos) are re-checked. For a **move** the
 folder is copied (local, or `rsync` to `host:path`), every file is sha256-verified
 against the source, then the checks above run again and the source's content is

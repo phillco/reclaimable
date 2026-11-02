@@ -1050,3 +1050,48 @@ def test_dirty_file_added_during_move_keeps_source(env, monkeypatch):
     monkeypatch.setattr(rc, "move_and_verify", slow)
     ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
     assert not ok and (wt / "late.txt").exists()
+
+
+# --- job state is re-asked right before removal ---------------------------------
+
+
+@pytest.mark.parametrize("later", ["open", "garbage", None])
+def test_job_state_change_after_evaluation_blocks_removal(env, later):
+    set_job(env, "9", "closed 2020-01-01T00:00:00Z")
+    f = make(env, "jj1", age_s=30 * DAY, job="9", kind="scratch")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.expired, v.reason  # positive answer is now cached
+    if later is None:
+        (
+            env.jobs / "9"
+        ).unlink()  # helper now exits 2 (unknown), as with a keep/hold label
+    else:
+        set_job(env, "9", later)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "job 9" in detail
+    assert "9" not in env.reg.get("jobs", {}) or not env.reg["jobs"]["9"].get("closed")
+
+
+def test_job_still_closed_removes(env):
+    set_job(env, "9", "closed 2020-01-01T00:00:00Z")
+    f = make(env, "jj2", age_s=30 * DAY, job="9", kind="scratch")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    ok, _ = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert ok and not f.exists()
+
+
+def test_job_label_added_during_move_keeps_source(env, monkeypatch):
+    set_job(env, "9", "closed 2020-01-01T00:00:00Z")
+    f, dest = make_movable(env, "jj3", job="9")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.action == "move", v.reason
+    real = rc.move_and_verify
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        (env.jobs / "9").unlink()
+        return out
+
+    monkeypatch.setattr(rc, "move_and_verify", slow)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "job 9" in detail

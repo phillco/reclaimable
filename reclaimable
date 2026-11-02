@@ -939,17 +939,24 @@ def parse_closed_at(text: str) -> float | None:
 
 
 def job_closed(
-    job: str, cfg: Config, reg: dict
+    job: str, cfg: Config, reg: dict, fresh: bool = False
 ) -> tuple[bool | None, float | None, str]:
     """(closed?, closed_at, detail) from the configured `job_done` command.
 
     Exit 0 = job closed (first stdout line may give the close time), 1 = still
-    open, anything else = unknown. None when it can't be resolved."""
+    open, anything else = unknown. None when it can't be resolved. A positive
+    answer is cached for an hour unless `fresh` (used right before removal), which
+    always runs the command and drops the cached answer on anything but closed."""
     if not cfg.job_done:
         return None, None, "no job_done command configured"
     cache = reg.setdefault("jobs", {})
     hit = cache.get(job)
-    if hit and hit.get("closed") and now() - hit.get("checked", 0) < 3600:
+    if (
+        not fresh
+        and hit
+        and hit.get("closed")
+        and now() - hit.get("checked", 0) < 3600
+    ):
         return True, hit.get("closed_at"), "closed"
     first_seen = (hit or {}).get("first_closed_seen")
     cmd = [_fill(a, job=job) for a in cfg.job_done["command"]]
@@ -964,10 +971,13 @@ def job_closed(
             env=env,
         )
     except subprocess.TimeoutExpired:
+        cache.pop(job, None)
         return None, None, "job_done timed out"
     except OSError as e:
+        cache.pop(job, None)
         return None, None, f"job_done failed to run ({e.strerror})"
     if res.returncode not in (0, 1):
+        cache.pop(job, None)
         return None, None, f"job_done exited {res.returncode}"
     closed = res.returncode == 0
     closed_at = (
@@ -1511,6 +1521,12 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
         busy = open_files(v.folder)
         if busy:
             return busy
+        # Job state may have changed (reopened, keep/hold label, helper failing):
+        # ask again, bypassing the cache.
+        if fresh.job:
+            closed, _, detail = job_closed(fresh.job, cfg, reg, fresh=True)
+            if not closed:
+                return f"job {fresh.job} {detail if closed is False else 'state unknown: ' + detail}"
         # Repeat the worktree checks: work may have been added since evaluation
         # (or during a long copy) that the original verdict never saw.
         w = walk(v.folder, cfg, check_names=True)
