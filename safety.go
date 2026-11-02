@@ -91,21 +91,19 @@ func listDir(path string) ([]os.DirEntry, error) {
 	return entries, err
 }
 func (a *App) expandDirs(pattern string) ([]string, error) {
-	p := a.expand(pattern)
-	var found []string
-	parts := strings.Split(p, string(filepath.Separator))
-	if filepath.IsAbs(p) {
+	path := a.expand(pattern)
+	found := []string{path}
+	deadline := time.Now().Add(300 * time.Second)
+	if strings.ContainsAny(path, "*?[") {
+		parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
 		found = []string{string(filepath.Separator)}
-		parts = parts[1:]
-	} else {
-		found = []string{parts[0]}
-		parts = parts[1:]
-	}
-	for _, part := range parts {
-		var next []string
-		for _, base := range found {
-			if strings.ContainsAny(part, "*?[") {
-				entries, err := listDir(base)
+		for _, part := range parts {
+			var next []string
+			for _, base := range found {
+				if time.Now().After(deadline) {
+					return nil, fmt.Errorf("glob expansion timed out: %s", pattern)
+				}
+				entries, err := a.ListDir(base)
 				if err != nil {
 					return nil, err
 				}
@@ -114,11 +112,9 @@ func (a *App) expandDirs(pattern string) ([]string, error) {
 						next = append(next, filepath.Join(base, e.Name()))
 					}
 				}
-			} else {
-				next = append(next, filepath.Join(base, part))
 			}
+			found = next
 		}
-		found = next
 	}
 	var out []string
 	for _, p := range found {
@@ -140,7 +136,7 @@ func jsonFiles(path string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".json") {
+		if strings.HasSuffix(fold(e.Name()), ".json") {
 			out = append(out, filepath.Join(path, e.Name()))
 		}
 	}
@@ -703,8 +699,7 @@ func sortedKeys[V any](m map[string]V) []string {
 	return out
 }
 func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (w Walk) {
-	repos := map[string]bool{}
-	defer func() { w.Repos = sortedKeys(repos) }()
+	folder = a.expand(folder)
 	inspected, err := a.Lstat(folder)
 	if err != nil {
 		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
@@ -729,9 +724,38 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (
 		w.Problem = "folder replaced during size walk"
 		return w
 	}
+	return a.walkAt(root, folder, cfg, checkNames, limit)
+}
+
+// walkAt opens a fresh directory description so reading never consumes the
+// caller's pinned root descriptor or changes its directory enumeration offset.
+func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool, limit float64) (w Walk) {
+	folder = a.expand(folder)
+	repos := map[string]bool{}
+	w.MarkerFolders = map[string]FileIdentity{}
+	defer func() { w.Repos = sortedKeys(repos) }()
+	scanRoot, err := openAt(root, ".", syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
+	if err != nil {
+		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
+		return w
+	}
+	defer scanRoot.Close()
+	opened, err := scanRoot.Stat()
+	if err != nil {
+		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
+		return w
+	}
+	if !opened.IsDir() {
+		w.Problem = "unreadable " + folder + ": not a real directory"
+		return w
+	}
 	dev := device(opened)
 	deadline := time.Now().Add(time.Duration(limit * float64(time.Second)))
-	protected := a.protectedIdentities(cfg)
+	protected, err := a.protectedIdentitiesChecked(cfg)
+	if err != nil {
+		w.Problem = fmt.Sprintf("deny-list unreadable (%s)", err)
+		return w
+	}
 	seen := map[FileIdentity]bool{}
 	patterns := make([]string, len(cfg.DenyPaths))
 	for i, p := range cfg.DenyPaths {
@@ -786,9 +810,22 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (
 				w.Problem = "unreadable " + p + ": " + err.Error()
 				return false
 			}
+			if fold(e.Name()) == fold(markerName) && a.pathKey(logical) != a.pathKey(folder) {
+				if !st.Mode().IsRegular() {
+					w.Problem = "invalid nested marker " + rel
+					return false
+				}
+				parentInfo, err := dir.Stat()
+				if err != nil {
+					w.Problem = fmt.Sprintf("unreadable %s: %s", logical, err)
+					return false
+				}
+				w.Markers = append(w.Markers, p)
+				w.MarkerFolders[p] = FileIdentity{device(parentInfo), inode(parentInfo)}
+			}
 			hitPath := false
 			for _, pattern := range patterns {
-				if pmatch(p, pattern) || pmatch(absolute, pattern) {
+				if a.pathMatch(p, pattern) || a.pathMatch(absolute, pattern) {
 					hitPath = true
 					break
 				}
@@ -801,7 +838,7 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (
 				w.Problem = "contains deny-listed " + rel
 				return false
 			}
-			if (fold(e.Name()) == ".git" || fold(e.Name()) == ".jj") && logical != folder {
+			if (fold(e.Name()) == ".git" || fold(e.Name()) == ".jj") && a.pathKey(logical) != a.pathKey(folder) {
 				repos[logical] = true
 			}
 			if st.IsDir() {
@@ -845,7 +882,7 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (
 		}
 		return true
 	}
-	if !descend(root, folder) {
+	if !descend(scanRoot, folder) {
 		return w
 	}
 	w.Size = &size
@@ -897,6 +934,61 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 		rel, _ := filepath.Rel(folder, w.Crossed[0])
 		return "contains another filesystem at " + rel, ""
 	}
+	nestedMarkers := map[string]*Marker{}
+	for _, markerPath := range w.Markers {
+		rel, _ := filepath.Rel(folder, markerPath)
+		label := "nested marker " + rel
+		nestedFolder := filepath.Dir(markerPath)
+		key := a.pathKey(nestedFolder)
+		if _, ok := nestedMarkers[key]; ok {
+			return label + ": ambiguous marker spelling", ""
+		}
+		parent, err := openPathDir(nestedFolder)
+		if err != nil {
+			return label + ": unreadable or invalid (" + err.Error() + ")", ""
+		}
+		parentInfo, err := parent.Stat()
+		expected, known := w.MarkerFolders[markerPath]
+		if err != nil || !known || expected != (FileIdentity{device(parentInfo), inode(parentInfo)}) {
+			parent.Close()
+			return label + ": unreadable or invalid (marker directory changed since walk)", ""
+		}
+		nested, err := a.readMarkerAt(parent, nestedFolder, filepath.Base(markerPath))
+		closeErr := parent.Close()
+		if err != nil {
+			return label + ": unreadable or invalid (" + err.Error() + ")", ""
+		}
+		if closeErr != nil {
+			return label + ": unreadable or invalid (" + closeErr.Error() + ")", ""
+		}
+		if len(nested.Holds) > 0 {
+			return label + ": held", ""
+		}
+		if nested.Job != "" || nested.Session != "" {
+			return label + ": job/session requires independent removal", ""
+		}
+		ttl, err := parseTTL(a.markerTTL(nested))
+		if err != nil {
+			return label + ": unreadable or invalid (" + err.Error() + ")", ""
+		}
+		if a.Now()-nested.Mtime < ttl {
+			return label + ": not expired", ""
+		}
+		if nested.MoveTo != "" || (cfg.MoveRoot != "" && nested.effectiveKind() != "cache") {
+			return label + ": move requires independent removal", ""
+		}
+		if denied := a.denyReason(nested.Folder, cfg); denied != "" {
+			return label + ": refused: " + denied, ""
+		}
+		if held := a.holderHold(nested, cfg); held != "" {
+			return label + ": held: " + held, ""
+		}
+		if problem, _ := a.treeProblem(nested.Folder, nested, cfg, Walk{}); problem != "" {
+			return label + ": " + problem, ""
+		}
+		nestedMarkers[key] = nested
+	}
+
 	repo, problem := a.RepoState(folder)
 	if problem != "" {
 		return "worktree " + problem, repo
@@ -922,7 +1014,14 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 		if problem != "" {
 			return "nested repo " + rel + " " + problem, repo
 		}
-		if (kind == "git-linked" || kind == "jj-secondary") && !ignoredOK {
+		nestedIgnoredOK := ignoredOK
+		for _, ancestor := range ancestors(nested) {
+			if ownMarker := nestedMarkers[a.pathKey(ancestor)]; ownMarker != nil {
+				nestedIgnoredOK, _ = ownMarker.Extra["ignored_ok"].(bool)
+				break
+			}
+		}
+		if (kind == "git-linked" || kind == "jj-secondary") && !nestedIgnoredOK {
 			if hidden := a.ignoredFiles(nested, kind); hidden != "" {
 				return "nested repo " + rel + " " + hidden, repo
 			}
@@ -945,6 +1044,7 @@ func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool
 		return v
 	}
 	v.Marker = m
+	v.DirectoryID = m.DirectoryID
 	v.LastUsed = m.Mtime
 	entry := markerEntry(reg, folder, a.Now())
 	if n, ok := entry["size"]; ok {

@@ -324,8 +324,8 @@ func (a *App) armedState() (bool, string) {
 	return true, fmt.Sprintf("armed since %s %s", time.Unix(0, int64(at*1e9)).Format("2006-01-02"), clock(at))
 }
 
-func (a *App) plan(verdicts []*Verdict, cfg *Config) []Planned {
-	chosen, _ := a.planChecked(verdicts, cfg)
+func (a *App) plan(verdicts []*Verdict, cfg *Config, estimate ...bool) []Planned {
+	chosen, _ := a.planChecked(verdicts, cfg, estimate...)
 	return chosen
 }
 
@@ -342,10 +342,15 @@ func (a *App) volumeLimits(folder string, cfg *Config) (floor, target int64, ok 
 	if err != nil {
 		return 0, 0, false
 	}
-	for !isMount(mount) && filepath.Dir(mount) != mount {
+	for !a.IsMount(mount) && filepath.Dir(mount) != mount {
 		mount = filepath.Dir(mount)
 	}
-	floor, ok = cfg.VolumeFloors[a.expand(mount)]
+	for _, key := range sortedKeys(cfg.VolumeFloors) {
+		if a.pathKey(key) == a.pathKey(mount) {
+			floor, ok = cfg.VolumeFloors[key], true
+			break
+		}
+	}
 	if !ok {
 		if device(st) != device(home) {
 			return 0, 0, false
@@ -359,7 +364,8 @@ func (a *App) volumeLimits(folder string, cfg *Config) (floor, target int64, ok 
 	return floor, target, true
 }
 
-func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
+func (a *App) planChecked(verdicts []*Verdict, cfg *Config, estimateOption ...bool) ([]Planned, error) {
+	estimate := len(estimateOption) == 0 || estimateOption[0]
 	chosen := []Planned{}
 	picked := map[*Verdict]bool{}
 	for _, v := range verdicts {
@@ -390,7 +396,7 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
 		if e != nil {
 			return nil, e
 		}
-		for !isMount(mount) && filepath.Dir(mount) != mount {
+		for !a.IsMount(mount) && filepath.Dir(mount) != mount {
 			mount = filepath.Dir(mount)
 		}
 		floor, ok := cfg.VolumeFloors[mount]
@@ -408,9 +414,11 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
 		if e != nil {
 			return nil, e
 		}
-		for _, p := range chosen {
-			if s, e := os.Stat(p.V.Folder); e == nil && device(s) == dev && p.V.Size != nil {
-				free += *p.V.Size
+		if estimate {
+			for _, p := range chosen {
+				if s, e := os.Stat(p.V.Folder); e == nil && device(s) == dev && p.V.Size != nil {
+					free += *p.V.Size
+				}
 			}
 		}
 		if free >= floor {
@@ -419,14 +427,16 @@ func (a *App) planChecked(verdicts []*Verdict, cfg *Config) ([]Planned, error) {
 		ordered := append([]*Verdict(nil), group...)
 		sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].LastUsed < ordered[j].LastUsed })
 		for _, v := range ordered {
-			if free >= target {
+			if estimate && free >= target {
 				break
 			}
 			if v.Safe && !picked[v] && v.Size != nil && *v.Size != 0 {
 				why := fmt.Sprintf("low space (%s free < floor %s), LRU", humanBytes(&free), humanBytes(&floor))
 				chosen = append(chosen, Planned{v, why})
 				picked[v] = true
-				free += *v.Size
+				if estimate {
+					free += *v.Size
+				}
 			}
 		}
 	}
@@ -473,14 +483,12 @@ func (a *App) sweep(args Args, cfg *Config) int {
 	for _, f := range folders {
 		vs = append(vs, a.evaluate(f, cfg, reg, true))
 	}
-	actions, e := a.planChecked(vs, cfg)
+	actions, e := a.planChecked(vs, cfg, !armed)
 	if e != nil {
 		return a.fail(e, 1)
 	}
 	done := []map[string]any{}
 	acted := map[*Verdict]bool{}
-	freedOn := map[uint64]int64{}
-	startFree := map[uint64]int64{}
 	var freed, would int64
 	for _, p := range actions {
 		v := p.V
@@ -490,27 +498,14 @@ func (a *App) sweep(args Args, cfg *Config) int {
 			verb = "move"
 		}
 		pressure := strings.HasPrefix(p.Why, "low space")
-		var dev uint64
-		devKnown := false
 		if armed && pressure {
 			_, target, limited := a.volumeLimits(v.Folder, cfg)
-			if st, err := os.Stat(v.Folder); err == nil {
-				dev, devKnown = device(st), true
-			}
-			if limited && devKnown {
-				start, err := a.FreeBytes(v.Folder)
-				if err != nil {
-					return a.fail(err, 1)
-				}
-				if _, ok := startFree[dev]; !ok {
-					startFree[dev] = start
-				}
+			if limited {
 				real, err := a.FreeBytes(v.Folder)
 				if err != nil {
 					return a.fail(err, 1)
 				}
-				estimated := startFree[dev] + freedOn[dev]
-				if max(real, 0) >= target || estimated >= target {
+				if max(real, 0) >= target {
 					line := fmt.Sprintf("skip %s: free space target reached (%s free >= %s)", v.Folder, humanBytes(&real), humanBytes(&target))
 					if err := a.log(line); err != nil {
 						return a.fail(err, 1)
@@ -527,9 +522,6 @@ func (a *App) sweep(args Args, cfg *Config) int {
 			}
 		}
 		ok, detail := a.removeFolder(v, armed, cfg, reg, pressure)
-		if ok && devKnown && v.Size != nil {
-			freedOn[dev] += *v.Size
-		}
 		prefix, action := "", verb
 		if !armed {
 			prefix = "[dry-run] "
@@ -670,6 +662,10 @@ func (a *App) cmdTouch(args Args) int {
 	}
 	return rc
 }
+func sameHoldSubpath(a *App, value any, want string) bool {
+	path, ok := value.(string)
+	return ok && a.pathKey(path) == a.pathKey(want)
+}
 func (a *App) cmdHold(args Args, release bool) int {
 	folder := a.resolveFolder(args.Path)
 	unlock, e := a.HoldLock()
@@ -694,9 +690,9 @@ func (a *App) cmdHold(args Args, release bool) int {
 	for _, h := range m.Holds {
 		same := h["job"] == job
 		if release {
-			same = same && (sub == "" || h["path"] == sub)
+			same = same && (sub == "" || sameHoldSubpath(a, h["path"], sub))
 		} else {
-			same = same && ((sub == "" && h["path"] == nil) || h["path"] == sub)
+			same = same && ((sub == "" && h["path"] == nil) || sub != "" && sameHoldSubpath(a, h["path"], sub))
 		}
 		if !same {
 			holds = append(holds, h)

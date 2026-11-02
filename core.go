@@ -304,7 +304,7 @@ func (a *App) loadConfig(path string) (*Config, error) {
 			if e != nil {
 				return nil, e
 			}
-			volumes[a.expand(k)] = n
+			volumes[a.pathKey(k)] = n
 		}
 	}
 	format := "{path}"
@@ -346,12 +346,8 @@ func (a *App) defaultRoots() []string {
 
 func writable(p string) bool { return syscall.Access(p, 2|4|1) == nil }
 
-func (a *App) readMarker(folder string) (*Marker, error) {
-	path := filepath.Join(folder, markerName)
-	content, e := os.ReadFile(path)
-	if e != nil {
-		return nil, e
-	}
+func (a *App) parseMarker(content []byte, folder string, st os.FileInfo) (*Marker, error) {
+	var e error
 	var v any
 	dec := json.NewDecoder(bytes.NewReader(content))
 	dec.UseNumber()
@@ -364,9 +360,6 @@ func (a *App) readMarker(folder string) (*Marker, error) {
 		return nil, e
 	}
 	if v == nil {
-		if _, e = os.Stat(path); e != nil {
-			return nil, e
-		}
 		return nil, errors.New("marker is not a JSON object")
 	}
 	data := dict(v)
@@ -414,10 +407,6 @@ func (a *App) readMarker(folder string) (*Marker, error) {
 			}
 			holds = append(holds, m)
 		}
-	}
-	st, e := os.Stat(path)
-	if e != nil {
-		return nil, e
 	}
 	extra := map[string]any{}
 	for k, v := range data {
@@ -559,6 +548,9 @@ func globMatch(name, pattern string) bool {
 
 func pathParts(p string) []string {
 	p = filepath.Clean(p)
+	if p == "/" {
+		return []string{"/"}
+	}
 	parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	if strings.HasPrefix(p, "/") {
 		parts = append([]string{"/"}, parts...)
@@ -578,20 +570,44 @@ func ancestors(p string) []string {
 	return out
 }
 
-const dataVolume = "/System/Volumes/Data"
+var dataVolume = "/System/Volumes/Data"
 
 type FileIdentity struct{ Dev, Ino uint64 }
 
 func stripData(path string) string {
-	if path == dataVolume {
-		return "/"
+	parts, prefix := pathParts(path), pathParts(dataVolume)
+	if len(parts) >= len(prefix) {
+		same := true
+		for i, p := range prefix {
+			if fold(parts[i]) != fold(p) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return filepath.Join(append([]string{"/"}, parts[len(prefix):]...)...)
+		}
 	}
-	if strings.HasPrefix(path, dataVolume+"/") {
-		return path[len(dataVolume):]
-	}
-	return path
+	return filepath.Clean(path)
 }
-func pmatch(name, pattern string) bool { return globMatch(fold(name), fold(pattern)) }
+func pathKey(path string) string {
+	home, _ := os.UserHomeDir()
+	if path == "~" {
+		path = home
+	} else if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(home, path[2:])
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	return fold(stripData(path))
+}
+func (a *App) pathKey(path string) string { return fold(a.expand(path)) }
+func (a *App) pathMatch(path, pattern string) bool {
+	return globMatch(a.pathKey(path), a.pathKey(pattern))
+}
+func (a *App) within(path, root string) bool { return keyWithin(a.pathKey(path), a.pathKey(root)) }
+func pmatch(name, pattern string) bool       { return globMatch(fold(name), fold(pattern)) }
 func identity(path string) (FileIdentity, bool) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -599,16 +615,32 @@ func identity(path string) (FileIdentity, bool) {
 	}
 	return FileIdentity{device(info), inode(info)}, true
 }
-func (a *App) protectedIdentities(cfg *Config) map[FileIdentity]bool {
-	out := map[FileIdentity]bool{}
+func (a *App) denyTargets(cfg *Config) ([]string, error) {
+	out := []string{}
 	for _, raw := range cfg.DenyPaths {
-		p := a.expand(raw)
-		if !strings.ContainsAny(p, "*?[") {
-			if id, ok := identity(p); ok {
-				out[id] = true
-			}
+		targets, err := a.expandDirs(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, targets...)
+	}
+	return out, nil
+}
+func (a *App) protectedIdentitiesChecked(cfg *Config) (map[FileIdentity]bool, error) {
+	targets, err := a.denyTargets(cfg)
+	if err != nil {
+		return nil, err
+	}
+	out := map[FileIdentity]bool{}
+	for _, p := range targets {
+		if id, ok := a.Identity(p); ok {
+			out[id] = true
 		}
 	}
+	return out, nil
+}
+func (a *App) protectedIdentities(cfg *Config) map[FileIdentity]bool {
+	out, _ := a.protectedIdentitiesChecked(cfg)
 	return out
 }
 func denyNameHit(parts []string, cfg *Config) string {
@@ -639,17 +671,26 @@ func denyNameHit(parts []string, cfg *Config) string {
 func (a *App) denyReason(path string, cfg *Config) string {
 	path = a.expand(path)
 	for _, p := range ancestors(path) {
-		st, e := a.Lstat(p)
-		if e == nil && st.Mode()&os.ModeSymlink != 0 {
+		st, err := a.Lstat(p)
+		if err == nil && st.Mode()&os.ModeSymlink != 0 {
 			return fmt.Sprintf("symlink in path (%s); mark the real directory", p)
 		}
 	}
-	real, e := filepath.EvalSymlinks(path)
-	if e != nil {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
 		real = path
 	}
 	real = a.expand(real)
-	protected := a.protectedIdentities(cfg)
+	targets, err := a.denyTargets(cfg)
+	if err != nil {
+		return fmt.Sprintf("deny-list unreadable (%s)", err)
+	}
+	protected := map[FileIdentity]bool{}
+	for _, p := range targets {
+		if id, ok := a.Identity(p); ok {
+			protected[id] = true
+		}
+	}
 	candidates := []string{path}
 	if real != path {
 		candidates = append(candidates, real)
@@ -662,21 +703,21 @@ func (a *App) denyReason(path string, cfg *Config) string {
 		}
 		ids := make([]identified, len(chain))
 		for i, p := range chain {
-			ids[i].id, ids[i].ok = identity(p)
+			ids[i].id, ids[i].ok = a.Identity(p)
 		}
 		cand := ids[0]
 		for _, raw := range cfg.DenyExact {
 			target := a.expand(raw)
-			same := fold(candidate) == fold(target)
+			same := a.pathKey(candidate) == a.pathKey(target)
 			if cand.ok {
-				tid, ok := identity(target)
+				tid, ok := a.Identity(target)
 				same = same || ok && cand.id == tid
 			}
 			if same {
 				return "broad folder " + raw
 			}
 		}
-		if p := fold(filepath.Dir(candidate)); p == "/users" || p == "/volumes" {
+		if p := a.pathKey(filepath.Dir(candidate)); p == "/users" || p == "/volumes" {
 			return "home or volume root"
 		}
 		for _, id := range ids {
@@ -687,24 +728,35 @@ func (a *App) denyReason(path string, cfg *Config) string {
 		for _, raw := range cfg.DenyPaths {
 			pattern := a.expand(raw)
 			for _, anc := range chain {
-				if pmatch(anc, pattern) {
+				if a.pathMatch(anc, pattern) {
 					return "deny-list " + raw
 				}
 			}
-			if candidate != "/" && pmatch(pattern+"/", candidate+"/*") {
-				return "contains deny-listed " + raw
+			base := pattern
+			for strings.ContainsAny(base, "*?[") {
+				next := filepath.Dir(base)
+				if next == base {
+					break
+				}
+				base = next
 			}
-			base := strings.Split(pattern, "*")[0]
-			if strings.Contains(pattern, "*") && strings.HasPrefix(fold(base), fold(candidate)+"/") {
+			if a.within(base, candidate) {
 				return "may contain deny-listed " + raw
 			}
-			if !strings.ContainsAny(pattern, "*?[") && cand.ok {
-				for _, p := range ancestors(a.expand(raw)) {
-					id, ok := identity(p)
+		}
+		for _, target := range targets {
+			same := a.within(target, candidate)
+			if cand.ok && !same {
+				for _, p := range ancestors(target) {
+					id, ok := a.Identity(p)
 					if ok && id == cand.id {
-						return "contains deny-listed " + raw
+						same = true
+						break
 					}
 				}
+			}
+			if same {
+				return "contains deny-listed " + target
 			}
 		}
 		parts := pathParts(candidate)
@@ -758,80 +810,100 @@ func (a *App) register(folder string) error {
 }
 func (a *App) scan(roots []string, cfg *Config, limit float64) (map[string]bool, bool) {
 	found := map[string]bool{}
+	complete := true
 	deadline := time.Now().Add(time.Duration(limit * float64(time.Second)))
 	prune := map[string]bool{}
+	names := map[string]bool{}
+	for name := range pruneNames {
+		names[fold(name)] = true
+	}
 	for _, p := range prunePaths {
-		prune[a.expand(p)] = true
+		prune[a.pathKey(p)] = true
 	}
-	complete := true
-	type node struct {
-		folder string
-		depth  int
-	}
-	for _, root := range roots {
-		stack := []node{{root, 0}}
-		var rootDev uint64
-		st, e := os.Stat(root)
-		known := e == nil
-		if known {
-			rootDev = device(st)
+	var visit func(*os.File, string, int, uint64)
+	visit = func(dir *os.File, folder string, depth int, dev uint64) {
+		if time.Now().After(deadline) {
+			complete = false
+			return
 		}
-		for len(stack) > 0 {
+		a.fsBefore("scan-read-dir", folder, ".")
+		entries, err := dir.ReadDir(-1)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if fold(entry.Name()) == fold(markerName) {
+				st, err := a.StatAt(dir, entry.Name(), false)
+				if err == nil && st.Mode().IsRegular() {
+					found[folder] = true
+					return
+				}
+			}
+		}
+		if depth >= 8 {
+			complete = false
+			return
+		}
+		for _, entry := range entries {
 			if time.Now().After(deadline) {
-				return found, false
-			}
-			n := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			entries, e := os.ReadDir(n.folder)
-			if e != nil {
-				continue
-			}
-			marked := false
-			for _, entry := range entries {
-				if entry.Name() == markerName {
-					info, e := entry.Info()
-					if e == nil && info.Mode().IsRegular() {
-						marked = true
-						break
-					}
-				}
-			}
-			if marked {
-				found[n.folder] = true
-				continue
-			}
-			if n.depth >= 8 {
 				complete = false
+				return
+			}
+			name := entry.Name()
+			folded := fold(name)
+			if names[folded] || strings.HasSuffix(folded, ".app") || strings.HasSuffix(folded, ".photoslibrary") {
 				continue
 			}
-			for _, entry := range entries {
-				if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || pruneNames[entry.Name()] {
-					continue
-				}
-				p := filepath.Join(n.folder, entry.Name())
-				if prune[p] {
-					continue
-				}
-				info, e := entry.Info()
-				if e != nil || known && device(info) != rootDev {
-					continue
-				}
-				denied := false
-				for _, pattern := range cfg.DenyPaths {
-					if pmatch(p, a.expand(pattern)) {
-						denied = true
-						break
-					}
-				}
-				if !denied {
-					stack = append(stack, node{p, n.depth + 1})
+			path := filepath.Join(folder, name)
+			if prune[a.pathKey(path)] {
+				continue
+			}
+			denied := false
+			for _, pattern := range cfg.DenyPaths {
+				if a.pathMatch(path, pattern) {
+					denied = true
+					break
 				}
 			}
+			if denied {
+				continue
+			}
+			info, err := a.StatAt(dir, name, false)
+			if err != nil || !info.IsDir() || device(info) != dev {
+				continue
+			}
+			child, err := openAt(dir, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+			if err != nil {
+				continue
+			}
+			opened, err := child.Stat()
+			if err == nil && sameIdentity(info, opened) {
+				visit(child, path, depth+1, dev)
+				current, checkErr := a.StatAt(dir, name, false)
+				if checkErr != nil || !sameIdentity(opened, current) {
+					complete = false
+				}
+			}
+			child.Close()
 		}
+	}
+	for _, raw := range roots {
+		root := a.expand(raw)
+		dir, err := openPathDir(root)
+		if err != nil {
+			continue
+		}
+		info, err := dir.Stat()
+		if err == nil {
+			visit(dir, root, 0, device(info))
+		}
+		dir.Close()
 	}
 	return found, complete
 }
+
 func (a *App) discover(cfg *Config, reg map[string]any, force bool, roots []string) ([]string, error) {
+	registered := sortedKeys(mapEntry(reg, "markers"))
 	if force || len(roots) > 0 || a.Now()-number(reg["last_scan"]) > day {
 		r := roots
 		if len(r) == 0 {
@@ -849,7 +921,17 @@ func (a *App) discover(cfg *Config, reg map[string]any, force bool, roots []stri
 	out := []string{}
 	markers := mapEntry(reg, "markers")
 	seen := map[string]bool{}
-	for _, original := range sortedKeys(markers) {
+	order := append([]string{}, registered...)
+	prior := map[string]bool{}
+	for _, p := range registered {
+		prior[p] = true
+	}
+	for _, p := range sortedKeys(markers) {
+		if !prior[p] {
+			order = append(order, p)
+		}
+	}
+	for _, original := range order {
 		f := original
 		if !filepath.IsAbs(f) {
 			if err := a.log("ignoring relative registry path " + pyRepr(f)); err != nil {
@@ -866,20 +948,21 @@ func (a *App) discover(cfg *Config, reg map[string]any, force bool, roots []stri
 			}
 			f = normalized
 		}
-		if seen[f] {
+		if seen[a.pathKey(f)] {
 			continue
 		}
-		seen[f] = true
 		if !isFile(filepath.Join(f, markerName)) {
 			delete(markers, f)
 			continue
 		}
 		if len(roots) == 0 {
 			out = append(out, f)
+			seen[a.pathKey(f)] = true
 		} else {
 			for _, r := range roots {
-				if within(f, r) {
+				if a.within(f, r) {
 					out = append(out, f)
+					seen[a.pathKey(f)] = true
 					break
 				}
 			}
@@ -889,13 +972,15 @@ func (a *App) discover(cfg *Config, reg map[string]any, force bool, roots []stri
 	return out, nil
 }
 func (a *App) exportOK(p string) bool {
+	p = a.expand(p)
 	for _, anc := range ancestors(p) {
-		st, e := a.Lstat(anc)
-		if e != nil || st.Mode()&os.ModeSymlink != 0 {
+		st, err := a.Lstat(anc)
+		if err != nil || st.Mode()&os.ModeSymlink != 0 {
 			return false
 		}
 	}
-	return !isMount(p) && filepath.Dir(p) != "/Users" && filepath.Dir(p) != "/Volumes" && p != a.Home
+	parent := a.pathKey(filepath.Dir(p))
+	return !a.IsMount(p) && parent != "/users" && parent != "/volumes" && a.pathKey(p) != a.pathKey(a.Home)
 }
 func (a *App) writeExportList(reg map[string]any, cfg *Config) error {
 	if cfg.ExportList == "" {

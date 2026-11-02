@@ -48,3 +48,7 @@ func (a *App) fsBefore(op, parent, name string) {
 		a.FSBefore(op, parent, name)
 	}
 }
+
+func unchangedFile(a, b os.FileInfo) bool {
+	return sameIdentity(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && changeTime(a).Equal(changeTime(b))
+}

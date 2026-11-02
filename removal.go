@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -19,14 +20,30 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 		return nil, err
 	}
 	defer dir.Close()
+	return a.HashDir(dir, root)
+}
+func (a *App) fileHashesAt(rootDir *os.File, root string) (map[string]string, error) {
+	dir, err := openAt(rootDir, ".", os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
 	info, err := dir.Stat()
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseExtendedDataFD(dir); err != nil {
 		return nil, err
 	}
 	rootDev := device(info)
 	out := map[string]string{}
 	var visit func(*os.File, string, string) error
 	visit = func(parent *os.File, relative, logical string) error {
+		before, statErr := parent.Stat()
+		if statErr != nil {
+			return statErr
+		}
+		a.fsBefore("hash-read-dir", logical, ".")
 		entries, err := parent.ReadDir(-1)
 		if err != nil {
 			return err
@@ -53,6 +70,25 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 				if err != nil || !sameIdentity(st, fresh) {
 					return fmt.Errorf("entry changed during hashing: %s", path)
 				}
+				pinned, pinErr := pinSymlinkAt(parent, name)
+				if pinErr != nil {
+					return pinErr
+				}
+				pinnedInfo, statErr := pinned.Stat()
+				if statErr != nil || !unchangedFile(st, pinnedInfo) {
+					pinned.Close()
+					return fmt.Errorf("symlink changed during hashing: %s", path)
+				}
+				attrErr := refuseSymlinkExtendedDataAt(parent, name, pinned)
+				finalInfo, finalErr := a.StatAt(parent, name, false)
+				if finalErr != nil || !unchangedFile(st, finalInfo) {
+					pinned.Close()
+					return fmt.Errorf("symlink changed during hashing: %s", path)
+				}
+				pinned.Close()
+				if attrErr != nil {
+					return attrErr
+				}
 				out[rel] = "link:" + target
 			case st.IsDir():
 				if device(st) != rootDev {
@@ -68,10 +104,18 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 					child.Close()
 					return fmt.Errorf("directory changed during hashing: %s", path)
 				}
+				if attrErr := refuseExtendedDataFD(child); attrErr != nil {
+					child.Close()
+					return attrErr
+				}
 				err = visit(child, rel, path)
 				child.Close()
 				if err != nil {
 					return err
+				}
+				current, statErr := a.StatAt(parent, name, false)
+				if statErr != nil || !sameIdentity(st, current) {
+					return fmt.Errorf("directory changed during hashing: %s", path)
 				}
 			case st.Mode().IsRegular():
 				child, err := openAt(parent, name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
@@ -83,10 +127,19 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 					child.Close()
 					return fmt.Errorf("file changed during hashing: %s", path)
 				}
+				if attrErr := refuseExtendedDataFD(child); attrErr != nil {
+					child.Close()
+					return attrErr
+				}
+				a.fsBefore("hash-read", logical, name)
 				h := sha256.New()
 				_, err = io.Copy(h, child)
 				after, statErr := child.Stat()
+				current, pathErr := a.StatAt(parent, name, false)
 				closeErr := child.Close()
+				if pathErr != nil || !unchangedFile(opened, current) {
+					return fmt.Errorf("file changed during hashing: %s", path)
+				}
 				if err != nil {
 					return err
 				}
@@ -96,13 +149,20 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 				if closeErr != nil {
 					return closeErr
 				}
-				if after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
+				if !unchangedFile(after, opened) {
 					return fmt.Errorf("file changed during hashing: %s", path)
 				}
 				out[rel] = fmt.Sprintf("%x", h.Sum(nil))
 			default:
 				return fmt.Errorf("cannot hash special file %s", path)
 			}
+		}
+		after, statErr := parent.Stat()
+		if statErr != nil {
+			return statErr
+		}
+		if !unchangedFile(before, after) {
+			return fmt.Errorf("directory changed during hashing: %s", logical)
 		}
 		return nil
 	}
@@ -129,24 +189,37 @@ func (a *App) remoteRun(remote []string, host, script string) Result {
 	for i, arg := range remote {
 		cmd[i] = strings.ReplaceAll(strings.ReplaceAll(arg, "{host}", host), "{script}", script)
 	}
-	return a.Run(cmd, -1, "", nil)
+	return a.Run(cmd, 300, "", nil)
 }
 func (a *App) remoteHashes(host, path string, remote []string) (map[string]string, error) {
-	// Each phase must succeed; a failed cd/find/checksum must never produce a
-	// partial manifest that could authorize deleting the source.
-	script := "cd " + shellQuote(path) + " && find . -type f ! -name .DS_Store -exec shasum -a 256 {} + && find . -type l -exec sh -c 'for l do target=$(readlink \"$l\") || exit; printf '\"'\"'link:%s  %s\\n'\"'\"' \"$target\" \"$l\"; done' sh {} +"
-	res := a.remoteRun(remote, host, script)
+	res := a.remoteRun(remote, host, remoteArchiveScript("hash", path))
 	if res.Err != nil || res.Timeout || res.Code != 0 {
 		return nil, fmt.Errorf("remote hash failed")
 	}
+	dec := json.NewDecoder(strings.NewReader(res.Stdout))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("invalid remote manifest")
+	}
 	out := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSuffix(res.Stdout, "\n"), "\n") {
-		if line == "" {
-			continue
+	for dec.More() {
+		token, err = dec.Token()
+		if err != nil {
+			return nil, err
 		}
-		digest, rel, ok := strings.Cut(line, "  ")
+		rel, ok := token.(string)
 		if !ok {
-			return nil, fmt.Errorf("invalid remote manifest")
+			return nil, fmt.Errorf("invalid manifest path")
+		}
+		if _, ok := out[rel]; ok {
+			return nil, fmt.Errorf("duplicate manifest path")
+		}
+		if rel == "" || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, "../") || strings.ContainsRune(rel, 0) {
+			return nil, fmt.Errorf("invalid manifest path")
+		}
+		var digest string
+		if err = dec.Decode(&digest); err != nil {
+			return nil, err
 		}
 		if !strings.HasPrefix(digest, "link:") {
 			if len(digest) != 64 {
@@ -158,14 +231,18 @@ func (a *App) remoteHashes(host, path string, remote []string) (map[string]strin
 				}
 			}
 		}
-		rel = strings.TrimPrefix(rel, "./")
-		if _, exists := out[rel]; exists {
-			return nil, fmt.Errorf("duplicate remote manifest path")
-		}
 		out[rel] = digest
+	}
+	if _, err = dec.Token(); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err = dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("trailing remote manifest data")
 	}
 	return out, nil
 }
+
 func (a *App) moveDestination(destRoot, folder string) (host, dest string) {
 	host, root, found := strings.Cut(destRoot, ":")
 	if !found || strings.Contains(host, "/") {
@@ -206,17 +283,9 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 	src = withoutMarker(src)
 	var got map[string]string
 	if host != "" {
-		mk := a.remoteRun(remote, host, "mkdir -p "+shellQuote(dest))
-		if mk.Err != nil || mk.Timeout || mk.Code != 0 {
-			return false, "mkdir on " + host + " failed"
-		}
-		r := a.Run([]string{"rsync", "-a", "--exclude", ".DS_Store", folder + "/", host + ":" + dest + "/"}, -1, "", nil)
-		if r.Err != nil || r.Timeout || r.Code != 0 {
-			detail := strings.TrimSpace(r.Stderr)
-			if len(detail) > 120 {
-				detail = detail[:120]
-			}
-			return false, "rsync failed: " + detail
+		ok, detail := a.remoteCopyVerified(folder, dest, host, remote, src)
+		if !ok {
+			return false, detail
 		}
 		got, err = a.remoteHashes(host, dest, remote)
 		if err != nil {
@@ -228,13 +297,25 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 		} else if !os.IsNotExist(err) {
 			return false, "destination unreadable: " + err.Error()
 		}
-		if err = os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
-			return false, "copy failed: " + err.Error()
+		target, copyErr := a.copyTreePinned(folder, dest)
+		if copyErr != nil {
+			return false, "copy failed: " + copyErr.Error()
 		}
-		if err = a.copyTree(folder, dest); err != nil {
-			return false, "copy failed: " + err.Error()
+		defer target.Close()
+		a.fsBefore("verify-copy-root", filepath.Dir(dest), filepath.Base(dest))
+		got, err = a.HashDir(target, dest)
+		if err == nil {
+			current, openErr := openPathDir(dest)
+			if openErr != nil {
+				return false, "destination changed during verification: " + openErr.Error()
+			}
+			now, statErr := current.Stat()
+			current.Close()
+			want, wantErr := target.Stat()
+			if statErr != nil || wantErr != nil || !sameIdentity(now, want) {
+				return false, "destination changed during verification"
+			}
 		}
-		got, err = a.FileHashes(dest)
 		if err != nil {
 			return false, "destination hash failed: " + err.Error()
 		}
@@ -262,6 +343,13 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 			changed = changed[:3]
 		}
 		return false, fmt.Sprintf("hash mismatch at %s%s (missing %s, changed %s)", prefix, dest, pyStrings(missing), pyStrings(changed))
+	}
+	current, hashErr := a.FileHashes(folder)
+	if hashErr != nil {
+		return false, "source hash failed: " + hashErr.Error()
+	}
+	if !reflect.DeepEqual(withoutMarker(current), src) {
+		return false, "source changed while it was being copied"
 	}
 	return true, prefix + dest
 }
@@ -302,6 +390,7 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 			left = append(left, path)
 			return false
 		}
+		a.fsBefore("remove-read-dir", path, ".")
 		entries, err := dir.ReadDir(-1)
 		if err != nil {
 			left = append(left, path)
@@ -368,6 +457,9 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 	if err != nil {
 		return false, "folder unreadable: " + err.Error()
 	}
+	if v.DirectoryID != nil && (*v.DirectoryID != (FileIdentity{device(ident), inode(ident)})) {
+		return false, "folder replaced since evaluation"
+	}
 	sourceParent, err := openPathDir(filepath.Dir(v.Folder))
 	if err != nil {
 		return false, "folder parent unreadable: " + err.Error()
@@ -378,8 +470,17 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 	if err != nil || !sameIdentity(ident, anchored) {
 		return false, "folder replaced before descriptor anchoring"
 	}
+	sourceRoot, err := openAt(sourceParent, sourceName, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, "folder unreadable: " + err.Error()
+	}
+	defer sourceRoot.Close()
+	opened, err := sourceRoot.Stat()
+	if err != nil || !sameIdentity(ident, opened) {
+		return false, "folder replaced before descriptor anchoring"
+	}
 	recheck := func(src map[string]string) string {
-		fresh, err := a.readMarker(v.Folder)
+		fresh, err := a.readMarkerAt(sourceRoot, v.Folder, markerName)
 		if err != nil {
 			return "marker changed: " + err.Error()
 		}
@@ -432,7 +533,7 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 				return fmt.Sprintf("no longer expired (clock restarted %s ago, ttl %s)", humanAge(a.Now()-start), humanAge(ttl))
 			}
 		}
-		w := a.walk(v.Folder, cfg, true, 300)
+		w := a.walkAt(sourceRoot, v.Folder, cfg, true, 300)
 		reason, repo := a.treeProblem(v.Folder, fresh, cfg, w)
 		if reason != "" {
 			return reason
@@ -441,7 +542,7 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 			return "repository type changed since evaluation"
 		}
 		if src != nil {
-			current, err := a.FileHashes(v.Folder)
+			current, err := a.HashDir(sourceRoot, v.Folder)
 			if err != nil {
 				return "source hash failed: " + err.Error()
 			}
@@ -508,6 +609,16 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 		}
 		trash = filepath.Join(filepath.Dir(v.Folder), "."+filepath.Base(v.Folder)+".reclaimable-trash-"+strconv.FormatInt(int64(a.Now()), 10))
 		a.fsBefore("remove-rename", filepath.Dir(v.Folder), sourceName)
+		currentParent, openErr := openPathDir(filepath.Dir(v.Folder))
+		if openErr != nil {
+			return false, "folder parent changed before rename"
+		}
+		currentParentInfo, statErr := currentParent.Stat()
+		currentParent.Close()
+		pinnedParentInfo, pinErr := sourceParent.Stat()
+		if statErr != nil || pinErr != nil || !sameIdentity(currentParentInfo, pinnedParentInfo) {
+			return false, "folder parent changed before rename"
+		}
 		if err := renameAt(sourceParent, sourceName, sourceParent, filepath.Base(trash)); err != nil {
 			return false, "rename failed: " + err.Error()
 		}

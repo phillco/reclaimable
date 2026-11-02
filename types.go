@@ -31,15 +31,20 @@ type App struct {
 	Now                                                                            func() float64
 	Hostname                                                                       func() string
 	Run                                                                            func([]string, float64, string, []string) Result
+	RunInput                                                                       func([]string, float64, string, []string, io.Reader) Result
 	OpenFiles                                                                      func(string) string
 	ProcessCwd                                                                     func(int) string
 	SessionRunning                                                                 func(string) string // alive, gone, no-match, unknown
 	RepoState                                                                      func(string) (string, string)
 	Lstat                                                                          func(string) (os.FileInfo, error)
 	StatAt                                                                         func(*os.File, string, bool) (os.FileInfo, error)
+	Identity                                                                       func(string) (FileIdentity, bool)
+	ListDir                                                                        func(string) ([]os.DirEntry, error)
+	IsMount                                                                        func(string) bool
 	FSBefore                                                                       func(string, string, string)
 	Rename                                                                         func(string, string) error
 	FileHashes                                                                     func(string) (map[string]string, error)
+	HashDir                                                                        func(*os.File, string) (map[string]string, error)
 	MoveAndVerify                                                                  func(string, string, []string, map[string]string) (bool, string)
 	HoldLock                                                                       func() (func(), error)
 	FreeBytes                                                                      func(string) (int64, error)
@@ -60,6 +65,7 @@ type Config struct {
 	SessionGrace                    *float64
 }
 type Marker struct {
+	DirectoryID                                                *FileIdentity
 	Folder, Owner, TTL, Regenerate, Kind, Job, Session, MoveTo string
 	Holds                                                      []map[string]any
 	Mtime                                                      float64
@@ -86,8 +92,11 @@ type Walk struct {
 	Files          int
 	Problem        string
 	Repos, Crossed []string
+	Markers        []string
+	MarkerFolders  map[string]FileIdentity
 }
 type Verdict struct {
+	DirectoryID                *FileIdentity
 	Marker                     *Marker
 	Folder                     string
 	LastUsed, ClockStart, TTLS float64
@@ -131,7 +140,11 @@ func newApp() *App {
 	a.LastSweep = filepath.Join(a.StateDir, "last-sweep.json")
 	a.Hostname = func() string { h, _ := os.Hostname(); return strings.ToLower(strings.Split(h, ".")[0]) }
 	a.Run = runCommand
+	a.RunInput = runCommandInput
 	a.Lstat = os.Lstat
+	a.Identity = identity
+	a.ListDir = listDir
+	a.IsMount = isMount
 	a.StatAt = statAt
 	a.Rename = os.Rename
 	a.OpenFiles = a.openFiles
@@ -139,6 +152,7 @@ func newApp() *App {
 	a.SessionRunning = a.sessionRunning
 	a.RepoState = a.repoState
 	a.FileHashes = a.fileHashes
+	a.HashDir = a.fileHashesAt
 	a.MoveAndVerify = a.moveAndVerify
 	a.HoldLock = func() (func(), error) { return lockFile(filepath.Join(a.StateDir, "hold.lock")) }
 	a.FreeBytes = freeBytes
@@ -146,6 +160,9 @@ func newApp() *App {
 	return a
 }
 func runCommand(argv []string, timeout float64, cwd string, env []string) Result {
+	return runCommandInput(argv, timeout, cwd, env, nil)
+}
+func runCommandInput(argv []string, timeout float64, cwd string, env []string, input io.Reader) Result {
 	if len(argv) == 0 {
 		return Result{Code: -1, Err: fmt.Errorf("empty command")}
 	}
@@ -156,6 +173,7 @@ func runCommand(argv []string, timeout float64, cwd string, env []string) Result
 	}
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = input
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 250 * time.Millisecond
@@ -205,7 +223,7 @@ func (a *App) expand(p string) string {
 
 func (a *App) resolveFolder(p string) string {
 	p = a.expand(p)
-	if filepath.Base(p) == markerName {
+	if fold(filepath.Base(p)) == fold(markerName) {
 		p = filepath.Dir(p)
 	}
 	return p
@@ -354,17 +372,10 @@ func markerEntry(reg map[string]any, folder string, now float64) map[string]any 
 	}
 	return e
 }
-func related(a, b string) bool {
-	aa, ea := filepath.Abs(a)
-	bb, eb := filepath.Abs(b)
-	if ea != nil || eb != nil {
-		return true
-	}
-	return within(aa, bb) || within(bb, aa)
-}
-func within(p, root string) bool {
-	r, e := filepath.Rel(root, p)
-	return e == nil && (r == "." || r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)))
+func related(a, b string) bool   { return within(a, b) || within(b, a) }
+func within(p, root string) bool { return keyWithin(pathKey(p), pathKey(root)) }
+func keyWithin(child, parent string) bool {
+	return child == parent || parent == "/" || strings.HasPrefix(child, parent+"/")
 }
 func device(info os.FileInfo) uint64 {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {

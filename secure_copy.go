@@ -11,56 +11,71 @@ import (
 // copyTree anchors every ancestor and every recursive operation to open
 // descriptors. A leaf that changes between inspection and open is refused.
 func (a *App) copyTree(src, dest string) error {
+	target, err := a.copyTreePinned(src, dest)
+	if target != nil {
+		target.Close()
+	}
+	return err
+}
+func (a *App) copyTreePinned(src, dest string) (target *os.File, err error) {
 	source, err := openPathDir(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer source.Close()
+	if err = refuseExtendedDataFD(source); err != nil {
+		return nil, err
+	}
 	sourceInfo, err := source.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	parent, err := mkdirPathDirs(filepath.Dir(dest))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer parent.Close()
 	name := filepath.Base(dest)
 	a.fsBefore("copy-create", filepath.Dir(dest), name)
 	if err = mkdirAt(parent, name, 0700); err != nil {
-		return err
+		return nil, err
 	}
 	made, err := statAt(parent, name, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	a.fsBefore("copy-dest-descend", filepath.Dir(dest), name)
-	target, err := openCopyDir(parent, name, made)
+	target, err = openCopyDir(parent, name, made)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer target.Close()
+	openedTarget := target
+	defer func() {
+		if err != nil {
+			openedTarget.Close()
+		}
+	}()
 	if err = a.copyDirFD(source, target, sourceInfo, src, dest, device(sourceInfo)); err != nil {
-		return err
+		return nil, err
 	}
 	if err = verifyCopyLeaf(parent, name, target); err != nil {
-		return err
+		return nil, err
 	}
 	// Root names may have moved while their descriptors remained safely pinned.
 	// Such a copy cannot be accepted as a completed move.
 	fresh, err := openPathDir(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer fresh.Close()
 	current, err := fresh.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !sameIdentity(current, sourceInfo) {
-		return fmt.Errorf("source root changed during copy")
+		return nil, fmt.Errorf("source root changed during copy")
 	}
-	return nil
+	return target, nil
 }
 func openCopyDir(parent *os.File, name string, want os.FileInfo) (*os.File, error) {
 	f, err := openAt(parent, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
@@ -92,18 +107,22 @@ func verifyCopyLeaf(parent *os.File, name string, opened *os.File) error {
 	return nil
 }
 func (a *App) copyDirFD(source, target *os.File, info os.FileInfo, sourcePath, targetPath string, dev uint64) error {
+	if err := refuseExtendedDataFD(source); err != nil {
+		return err
+	}
+	a.fsBefore("copy-read-dir", sourcePath, ".")
 	entries, err := source.ReadDir(-1)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == ".DS_Store" {
-			continue
-		}
 		st, err := statAt(source, name, false)
 		if err != nil {
 			return err
+		}
+		if name == ".DS_Store" && !st.IsDir() {
+			continue
 		}
 		from, to := filepath.Join(sourcePath, name), filepath.Join(targetPath, name)
 		switch {
@@ -157,6 +176,9 @@ func (a *App) copyDirFD(source, target *os.File, info os.FileInfo, sourcePath, t
 				}
 				if !sameIdentity(got, st) {
 					return fmt.Errorf("symlink %s changed during copy", from)
+				}
+				if err := refuseSymlinkExtendedDataAt(source, name, pinned); err != nil {
+					return err
 				}
 				link, err := readlinkAt(source, name)
 				if err != nil {
@@ -214,6 +236,9 @@ func (a *App) copyDirFD(source, target *os.File, info os.FileInfo, sourcePath, t
 				if !opened.Mode().IsRegular() || !sameIdentity(opened, st) {
 					return fmt.Errorf("file %s changed during copy", from)
 				}
+				if err := refuseExtendedDataFD(in); err != nil {
+					return err
+				}
 				a.fsBefore("copy-create", targetPath, name)
 				out, err := openAt(target, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
 				if err != nil {
@@ -222,6 +247,13 @@ func (a *App) copyDirFD(source, target *os.File, info os.FileInfo, sourcePath, t
 				defer out.Close()
 				if _, err = io.Copy(out, in); err != nil {
 					return err
+				}
+				after, statErr := in.Stat()
+				if statErr != nil {
+					return statErr
+				}
+				if !unchangedFile(opened, after) {
+					return fmt.Errorf("file changed during copy: %s", from)
 				}
 				a.fsBefore("copy-metadata", targetPath, name)
 				if err = copyMetadataFD(in, out, st); err != nil {
