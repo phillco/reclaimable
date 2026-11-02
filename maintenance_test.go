@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -28,6 +29,152 @@ func maintenanceFixture(t *testing.T) (*testEnv, string) {
 func fakeExecutable(t *testing.T, bin, name, body string) {
 	t.Helper()
 	must(t, os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body), 0755))
+}
+
+func maintenanceChdir(t *testing.T, dir string) {
+	t.Helper()
+	old, err := os.Getwd()
+	must(t, err)
+	must(t, os.Chdir(dir))
+	t.Cleanup(func() { must(t, os.Chdir(old)) })
+}
+
+func TestMaintenanceExecutablePaths(t *testing.T) {
+	for _, executable := range []string{"./fixture-clean", "bin/fixture-clean", "fixture-clean", "absolute"} {
+		t.Run(executable, func(t *testing.T) {
+			e, bin := maintenanceFixture(t)
+			caller := filepath.Join(e.Root, "caller")
+			must(t, os.MkdirAll(filepath.Join(caller, "bin"), 0755))
+			maintenanceChdir(t, caller)
+			// Allow LookPath to return a relative PATH result, even on Go versions
+			// that normally reject it with ErrDot. The runner must still pin it.
+			t.Setenv("GODEBUG", "execerrdot=0")
+			t.Setenv("PATH", "bin")
+			callerBin, homeBin := caller, e.A.Home
+			if executable == "bin/fixture-clean" || executable == "fixture-clean" {
+				callerBin, homeBin = filepath.Join(caller, "bin"), bin
+			}
+			fakeExecutable(t, callerBin, "fixture-clean", "echo caller > \"$1.caller\"\n")
+			fakeExecutable(t, homeBin, "fixture-clean", "echo home > \"$1.home\"\n")
+			if executable == "absolute" {
+				executable = filepath.Join(callerBin, "fixture-clean")
+			}
+			h := &e.Cfg.Maintenance[0]
+			h.Command[0] = executable
+			sentinel := h.Command[1]
+			rows, _ := maintenanceRun(t, e, Args{})
+			check(t, !exists(sentinel+".home"), "home executable ran: %+v", rows)
+			allowed := filepath.IsAbs(executable) || executable == "fixture-clean"
+			check(t, (rows[0].Status == "success") == allowed && exists(sentinel+".caller") == allowed, "wrong execution: %+v", rows)
+			must(t, atomicWrite(e.A.ConfigFile, []byte(fmt.Sprintf("[[maintenance]]\nname = 'fixture'\ncommand = [%q]\nevery = '1h'\n", executable)), 0600))
+			_, err := e.A.loadConfig(e.A.ConfigFile)
+			check(t, (err == nil) == allowed, "wrong config validation for %q: %v", executable, err)
+		})
+	}
+}
+
+func TestMaintenancePinsExecutableBeforeProbes(t *testing.T) {
+	e, bin := maintenanceFixture(t)
+	other := t.TempDir()
+	fakeExecutable(t, other, "fixture-clean", "echo home > \"$1.home\"\n")
+	realRun := e.A.Run
+	e.A.Run = func(argv []string, timeout float64, cwd string, env []string) Result {
+		check(t, argv[0] == filepath.Join(bin, "fixture-clean") && cwd == e.A.Home, "unresolved hook: %q cwd=%q", argv, cwd)
+		return realRun(argv, timeout, cwd, env)
+	}
+	e.A.FreeBytes = func(string) (int64, error) {
+		t.Setenv("PATH", other)
+		return 10 * gb, nil
+	}
+	rows, failed := maintenanceRun(t, e, Args{})
+	check(t, !failed && rows[0].Status == "success" && !exists(e.Cfg.Maintenance[0].Command[1]+".home"), "hook resolved again: %+v", rows)
+}
+
+func TestMaintenanceProbeExecutablePaths(t *testing.T) {
+	for _, probe := range []string{"lsof", "pgrep", "fixture-busy"} {
+		t.Run(probe, func(t *testing.T) {
+			e, homeBin := maintenanceFixture(t)
+			caller := filepath.Join(e.Root, "caller")
+			callerBin := filepath.Join(caller, "bin")
+			must(t, os.MkdirAll(callerBin, 0755))
+			maintenanceChdir(t, caller)
+			t.Setenv("GODEBUG", "execerrdot=0")
+			t.Setenv("PATH", "bin")
+			sentinel := filepath.Join(e.Root, "probe")
+			fakeExecutable(t, callerBin, probe, fmt.Sprintf("echo caller > %q\nexit 1\n", sentinel+".caller"))
+			fakeExecutable(t, homeBin, probe, fmt.Sprintf("echo home > %q\nexit 1\n", sentinel+".home"))
+			h := &e.Cfg.Maintenance[0]
+			h.Command[0] = filepath.Join(homeBin, "fixture-clean")
+			switch probe {
+			case "lsof":
+				h.Lsof = []string{e.Root}
+			case "pgrep":
+				h.Processes = []string{"fixture"}
+			default:
+				h.BusyHolders = []map[string]any{{"command": []string{probe}}}
+			}
+			realRun := e.A.Run
+			e.A.Run = func(argv []string, timeout float64, cwd string, env []string) Result {
+				// Resolve before handing off to any runner, not inside exec.Command.
+				if filepath.Base(argv[0]) == probe {
+					if !filepath.IsAbs(argv[0]) {
+						t.Errorf("unresolved probe: %q", argv[0])
+					}
+					t.Setenv("PATH", homeBin)
+					cwd = e.A.Home
+				}
+				return realRun(argv, timeout, cwd, env)
+			}
+			rows, _ := maintenanceRun(t, e, Args{})
+			check(t, !exists(sentinel+".home"), "home probe executed: %+v", rows)
+			check(t, rows[0].Status == "success" && exists(sentinel+".caller"), "probe did not use caller PATH: %+v", rows)
+		})
+	}
+}
+
+func TestMaintenanceRejectsRelativeBusyExecutable(t *testing.T) {
+	e, _ := maintenanceFixture(t)
+	maintenanceChdir(t, e.Root)
+	fakeExecutable(t, e.Root, "fixture-busy", "echo ran > busy-ran\nexit 1\n")
+	e.Cfg.Maintenance[0].BusyHolders = []map[string]any{{"command": []string{"./fixture-busy"}}}
+	rows, _ := maintenanceRun(t, e, Args{})
+	check(t, rows[0].Status == "skipped" && !exists(filepath.Join(e.Root, "busy-ran")), "relative busy holder executed: %+v", rows)
+	config := "[[maintenance]]\nname = 'fixture'\ncommand = ['fixture-clean']\nevery = '1h'\nbusy_holders = ['busy']\n[[holder]]\nname = 'busy'\ncommand = ['./fixture-busy']\n"
+	must(t, atomicWrite(e.A.ConfigFile, []byte(config), 0600))
+	_, err := e.A.loadConfig(e.A.ConfigFile)
+	check(t, err != nil, "relative busy executable accepted")
+}
+
+func TestMaintenanceExecutableMustBeRegularAndExecutable(t *testing.T) {
+	for _, kind := range []string{"directory", "directory-link", "non-executable", "fifo"} {
+		for _, busy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/busy=%t", kind, busy), func(t *testing.T) {
+				e, _ := maintenanceFixture(t)
+				path := filepath.Join(e.Root, "invalid")
+				switch kind {
+				case "directory":
+					must(t, os.Mkdir(path, 0755))
+				case "directory-link":
+					must(t, os.Symlink(e.Root, path))
+				case "non-executable":
+					must(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0644))
+				case "fifo":
+					must(t, syscall.Mkfifo(path, 0755))
+				}
+				if busy {
+					e.Cfg.Maintenance[0].BusyHolders = []map[string]any{{"command": []string{path}}}
+				} else {
+					e.Cfg.Maintenance[0].Command[0] = path
+				}
+				e.A.Run = func([]string, float64, string, []string) Result {
+					t.Error("invalid executable reached runner")
+					return Result{Code: 1}
+				}
+				rows, _ := maintenanceRun(t, e, Args{})
+				check(t, rows[0].Status == "skipped", "invalid executable not refused: %+v", rows)
+			})
+		}
+	}
 }
 func maintenanceRun(t *testing.T, e *testEnv, args Args) ([]MaintenanceRecord, bool) {
 	t.Helper()

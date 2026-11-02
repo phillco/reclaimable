@@ -37,6 +37,56 @@ type MaintenanceRecord struct {
 	FreedGB    *float64 `json:"freed_gb"`
 }
 
+func maintenanceExecutableName(name string) error {
+	if strings.TrimSpace(name) == "" || strings.ContainsRune(name, 0) {
+		return fmt.Errorf("maintenance executable must be nonempty and contain no NUL")
+	}
+	if strings.ContainsRune(name, filepath.Separator) && !filepath.IsAbs(name) {
+		return fmt.Errorf("maintenance executable %q must be a bare name or an absolute path", name)
+	}
+	return nil
+}
+
+// Pin PATH results before changing cwd or handing an argv to a runner. Stat
+// follows executable symlinks, but their targets must be regular files.
+func maintenanceExecutable(name string) (string, error) {
+	if err := maintenanceExecutableName(name); err != nil {
+		return "", err
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(path) {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("maintenance executable did not resolve to an absolute path")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0111 == 0 {
+		return "", fmt.Errorf("maintenance executable %q is not a regular executable file", path)
+	}
+	return path, nil
+}
+
+func (a *App) runMaintenanceProbe(argv []string, timeout float64, cwd string, env []string) Result {
+	if len(argv) == 0 {
+		return Result{Code: -1, Err: fmt.Errorf("empty maintenance probe command")}
+	}
+	executable, err := maintenanceExecutable(argv[0])
+	if err != nil {
+		return Result{Code: -1, Err: err}
+	}
+	return a.Run(append([]string{executable}, argv[1:]...), timeout, cwd, env)
+}
+
 func maintenanceDuration(v any, field string) (float64, error) {
 	s, ok := v.(string)
 	if !ok {
@@ -101,8 +151,8 @@ func parseMaintenance(raw map[string]any, holders []map[string]any) ([]Maintenan
 				return nil, false, fmt.Errorf("maintenance argv contains NUL")
 			}
 		}
-		if strings.TrimSpace(cmd[0]) == "" {
-			return nil, false, fmt.Errorf("maintenance executable is empty")
+		if err := maintenanceExecutableName(cmd[0]); err != nil {
+			return nil, false, err
 		}
 		every, err := maintenanceDuration(m["every"], "every")
 		if err != nil {
@@ -163,8 +213,12 @@ func parseMaintenance(raw map[string]any, holders []map[string]any) ([]Maintenan
 				return nil, false, fmt.Errorf("busy holder %q must name exactly one command holder", ref)
 			}
 			holder := matches[0]
-			if _, err := command(holder, "busy holder "+ref); err != nil {
+			cmd, err := command(holder, "busy holder "+ref)
+			if err != nil {
 				return nil, false, err
+			}
+			if err := maintenanceExecutableName(cmd[0]); err != nil {
+				return nil, false, fmt.Errorf("busy holder %q: %w", ref, err)
 			}
 			// Holders use seconds, unlike maintenance's duration strings.
 			if v, exists := holder["timeout"]; exists {
@@ -201,19 +255,26 @@ func (a *App) maintenanceInUse(h Maintenance) string {
 		} else if !st.IsDir() {
 			return "lsof path is not a directory: " + p
 		}
-		r := a.Run([]string{"lsof", "-w", "-n", "-P", "-F", "pcn", "+D", p}, 90, "", nil)
+		r := a.runMaintenanceProbe([]string{"lsof", "-w", "-n", "-P", "-F", "pcn", "+D", p}, 90, "", nil)
 		if r.Timeout || r.Err != nil || r.Code != 1 || strings.TrimSpace(r.Stdout) != "" || strings.TrimSpace(r.Stderr) != "" {
 			return "lsof busy or check failed: " + p
 		}
 	}
 	for _, name := range h.Processes {
-		r := a.Run([]string{"pgrep", "-x", "--", regexp.QuoteMeta(name)}, 15, "", nil)
+		r := a.runMaintenanceProbe([]string{"pgrep", "-x", "--", regexp.QuoteMeta(name)}, 15, "", nil)
 		if r.Timeout || r.Err != nil || r.Code != 1 || strings.TrimSpace(r.Stdout) != "" || strings.TrimSpace(r.Stderr) != "" {
 			return "process busy or check failed: " + name
 		}
 	}
 	for _, holder := range h.BusyHolders {
-		if reason := a.commandHold(holder, &Marker{Folder: a.Home, Owner: h.Name, Kind: "cache"}); reason != "" {
+		cmd, err := command(holder, "maintenance busy holder")
+		if err != nil {
+			return err.Error()
+		}
+		if err := maintenanceExecutableName(cmd[0]); err != nil {
+			return err.Error()
+		}
+		if reason := a.commandHoldWithRunner(holder, &Marker{Folder: a.Home, Owner: h.Name, Kind: "cache"}, a.runMaintenanceProbe); reason != "" {
 			return reason
 		}
 	}
@@ -228,9 +289,9 @@ func (a *App) inspectMaintenance(args Args, cfg *Config, h Maintenance, last map
 		row.Detail = "not due"
 		return row, ""
 	}
-	executable, err := exec.LookPath(h.Command[0])
+	executable, err := maintenanceExecutable(h.Command[0])
 	if err != nil {
-		row.Detail = "executable unavailable: " + h.Command[0]
+		row.Detail = "executable unavailable: " + err.Error()
 		return row, ""
 	}
 	if reason := a.maintenanceInUse(h); reason != "" {

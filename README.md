@@ -260,8 +260,16 @@ bypass arming, free-space triggers, busy holders or in-use checks.
 
 The config's argv arrays are the allow-list: commands are never read from markers
 or other data files, substituted with marker values, or passed through a shell.
-The executable is resolved through the current PATH for each attempt; a missing
-tool is logged and skipped. Configure only trusted native commands and arguments.
+Each hook executable must be a bare name or an absolute path; configured relative
+paths containing `/` (including `./tool` and `~/bin/tool`) are config errors.
+Bare names are resolved through the current PATH once per attempt and pinned to
+an absolute path before execution, so the hook's home working directory cannot
+change which executable runs. Executables must resolve to regular executable
+files, including when symlinks are used; directories and symlinks to directories
+are refused. The same resolution and file checks apply to maintenance's `lsof`,
+`pgrep` and busy-holder commands; referenced busy holders also reject configured
+relative executable paths. Missing or invalid executables are logged and the hook
+is skipped. Configure only trusted native commands and arguments.
 Native tools own their cleanup policy; marker TTL/deny checks do not govern what
 a configured native tool removes.
 

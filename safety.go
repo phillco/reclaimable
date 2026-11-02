@@ -347,6 +347,9 @@ func shortText(s string, n int) string {
 }
 func firstLine(s string) string { return strings.Split(s, "\n")[0] }
 func (a *App) commandHold(holder map[string]any, m *Marker) string {
+	return a.commandHoldWithRunner(holder, m, a.Run)
+}
+func (a *App) commandHoldWithRunner(holder map[string]any, m *Marker, run func([]string, float64, string, []string) Result) string {
 	values := map[string]string{"folder": m.Folder, "path": m.Folder, "job": m.Job, "owner": m.Owner, "session": m.Session, "kind": m.effectiveKind()}
 	cmd, ok := a.filledCommand(holder["command"], values)
 	if !ok {
@@ -356,7 +359,7 @@ func (a *App) commandHold(holder map[string]any, m *Marker) string {
 	if name == "" {
 		name = filepath.Base(cmd[0])
 	}
-	r := a.Run(cmd, timeoutValue(holder, 60), "", withEnv(values))
+	r := run(cmd, timeoutValue(holder, 60), "", withEnv(values))
 	if r.Timeout {
 		return "holder " + name + " timed out"
 	}
