@@ -54,6 +54,7 @@ type App struct {
 type Config struct {
 	Maintenance                     []Maintenance
 	MaintenanceArmed                bool
+	MaintenanceOnly                 bool
 	Roots                           []string
 	Floor, Target                   int64
 	MoveRoot                        string

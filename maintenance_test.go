@@ -349,6 +349,140 @@ func TestMaintenanceAfterFolderRemoval(t *testing.T) {
 	must(t, err)
 	check(t, len(dict(raw)["maintenance"].([]any)) == 1, "report missing hook")
 }
+
+func TestMaintenanceOnlySweep(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		only, optedIn, dry, immediate bool
+		arm                           string
+		runs                          bool
+	}{
+		{name: "unarmed", optedIn: true},
+		{name: "unarmed-manual", optedIn: true, immediate: true},
+		{name: "maintenance-only", only: true, optedIn: true, runs: true},
+		{name: "opt-out", only: true},
+		{name: "dry-run", only: true, optedIn: true, dry: true},
+		{name: "armed", only: true, optedIn: true, arm: "ready", runs: true},
+		{name: "armed-manual", only: true, optedIn: true, arm: "ready", immediate: true, runs: true},
+		{name: "grace", only: true, optedIn: true, arm: "recent", runs: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := maintenanceFixture(t)
+			folder := e.make(t, "expired", 2*day, nil, nil)
+			must(t, e.A.register(folder))
+			config := fmt.Sprintf(`roots = [%q]
+floor_gb = 0
+target_gb = 0
+maintenance_only = %t
+maintenance_armed = %t
+[[maintenance]]
+name = "fixture"
+command = ["fixture-clean", %q]
+every = "24h"
+`, filepath.Join(e.Root, "data"), tc.only, tc.optedIn, e.Cfg.Maintenance[0].Command[1])
+			must(t, atomicWrite(e.A.ConfigFile, []byte(config), 0600))
+			e.A.LoadConfig = func() (*Config, error) { return e.A.loadConfig(e.A.ConfigFile) }
+			if tc.arm == "" {
+				must(t, os.Remove(e.A.ArmedFile))
+			} else if tc.arm == "recent" {
+				must(t, writeJSON(e.A.ArmedFile, map[string]any{"armed_at": e.A.Now()}))
+			}
+			argv := []string{"sweep"}
+			if tc.dry {
+				argv = append(argv, "-n")
+			}
+			if tc.immediate {
+				argv = append(argv, "-A")
+			}
+			check(t, e.A.main(argv) == 0, "sweep failed: %s", e.A.Err)
+			check(t, exists(folder) && exists(filepath.Join(folder, "blob.bin")), "folder removed")
+			check(t, exists(e.Cfg.Maintenance[0].Command[1]) == tc.runs, "unexpected hook execution: %s", e.A.Out)
+			check(t, exists(filepath.Join(e.A.StateDir, "maintenance.json")) == tc.runs, "dry run consumed cadence")
+			raw, err := loadJSON(e.A.LastSweep, nil)
+			must(t, err)
+			report := dict(raw)
+			actions := report["actions"].([]any)
+			check(t, report["armed"] == false && len(actions) == 1 && dict(actions[0])["done"] == false, "folder removal not dry-run: %+v", report)
+			rows := report["maintenance"].([]any)
+			check(t, len(rows) == 1 && (dict(rows[0])["status"] == "success") == tc.runs, "unexpected hook report: %+v", rows)
+		})
+	}
+}
+
+func TestMaintenanceOnlyGuards(t *testing.T) {
+	for _, guard := range []string{"busy", "lockfile", "process", "lsof", "free-space", "cadence", "timeout", "manual-dry-run"} {
+		t.Run(guard, func(t *testing.T) {
+			e, bin := maintenanceFixture(t)
+			must(t, os.Remove(e.A.ArmedFile))
+			e.Cfg.MaintenanceOnly = true
+			h := &e.Cfg.Maintenance[0]
+			switch guard {
+			case "busy":
+				fakeExecutable(t, bin, "fixture-busy", "exit 0\n")
+				h.BusyHolders = []map[string]any{{"command": []string{"fixture-busy"}}}
+			case "lockfile":
+				h.Lockfiles = []string{filepath.Join(e.Root, "cache.lock")}
+				must(t, os.WriteFile(h.Lockfiles[0], nil, 0600))
+			case "process":
+				fakeExecutable(t, bin, "pgrep", "exit 0\n")
+				h.Processes = []string{"fixture"}
+			case "lsof":
+				fakeExecutable(t, bin, "lsof", "exit 0\n")
+				h.Lsof = []string{e.Root}
+			case "free-space":
+				h.WhenFreeBelow = intPtr(1)
+			case "cadence":
+				must(t, writeJSON(filepath.Join(e.A.StateDir, "maintenance.json"), map[string]any{"fixture": map[string]any{"at": e.A.Now()}}))
+			case "timeout":
+				fakeExecutable(t, bin, "fixture-clean", "sleep 1\necho ran > \"$1\"\n")
+				h.Timeout = 0.02
+			case "manual-dry-run":
+				check(t, e.A.main([]string{"maintenance", "-n", "-f"}) == 0, "manual dry run failed")
+				check(t, !exists(h.Command[1]), "manual dry run executed hook")
+				return
+			}
+			rows, failed := maintenanceRun(t, e, Args{})
+			check(t, !exists(h.Command[1]), "guard permitted cleanup: %+v", rows)
+			if guard == "timeout" {
+				check(t, failed && rows[0].TimedOut, "timeout not enforced: %+v", rows)
+			} else {
+				check(t, !failed && rows[0].Status == "skipped", "guard not preserved: %+v", rows)
+			}
+		})
+	}
+}
+
+func TestMaintenanceOnlyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		config string
+		want   bool
+	}{
+		{"", false},
+		{"maintenance_only = true", true},
+		{"maintenance_only = false", false},
+		{"[hosts.fixture-host]\nmaintenance_only = true", true},
+		{"maintenance_only = true\n[hosts.fixture-host]\nmaintenance_only = false", false},
+		{"maintenance_only = false\n[hosts.fixture-host]\nmaintenance_only = true", true},
+		{"[hosts.other-host]\nmaintenance_only = true", false},
+	} {
+		t.Run(tc.config, func(t *testing.T) {
+			e := newTestEnv(t)
+			must(t, atomicWrite(e.A.ConfigFile, []byte(tc.config), 0600))
+			cfg, err := e.A.loadConfig(e.A.ConfigFile)
+			must(t, err)
+			check(t, cfg.MaintenanceOnly == tc.want && !cfg.MaintenanceArmed, "config: %+v", cfg)
+		})
+	}
+	for _, prefix := range []string{"", "[hosts.fixture-host]\n"} {
+		for _, value := range []string{`"true"`, "1", "[]", "{}"} {
+			e := newTestEnv(t)
+			must(t, atomicWrite(e.A.ConfigFile, []byte(prefix+"maintenance_only = "+value), 0600))
+			_, err := e.A.loadConfig(e.A.ConfigFile)
+			check(t, err != nil, "invalid maintenance_only accepted: %s%s", prefix, value)
+		}
+	}
+}
+
 func TestMaintenanceConfig(t *testing.T) {
 	base := `maintenance_armed = true
 [[maintenance]]

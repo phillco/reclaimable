@@ -449,6 +449,8 @@ func (a *App) sweep(args Args, cfg *Config) int {
 	armed, mode := false, ""
 	if args.DryRun {
 		mode = "dry-run (forced)"
+	} else if cfg.MaintenanceOnly {
+		mode = "dry-run (maintenance only)"
 	} else if args.Armed {
 		armed = exists(a.ArmedFile)
 		mode = "armed (manual)"

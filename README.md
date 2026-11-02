@@ -6,7 +6,7 @@ isn't freed when something else needs it, and nobody knows what is safe to delet
 folder it governs, and one janitor per host (`reclaimable sweep`, run hourly from
 launchd/cron/systemd) removes or moves expired folders and frees space
 least-recently-used first when a disk runs low. It only touches folders that pass
-every safety check, and it does nothing until you arm the host.
+every safety check, and folder cleanup does nothing until you arm the host.
 
 Single Go executable for macOS/Linux (amd64/arm64), Go 1.22+. The only library
 dependency is pinned and vendored: `github.com/BurntSushi/toml` v1.4.0.
@@ -154,9 +154,10 @@ Removal renames the folder aside through its checked parent descriptor, verifies
 its identity again, then deletes it through descriptors. These checks prevent
 symlink redirection; they do not freeze a tree against concurrent writers.
 
-**Dry-run until armed.** Sweeps act only once the host is armed (`reclaimable arm`)
+**Dry-run until armed.** Folder sweeps act only once the host is armed (`reclaimable arm`)
 and 24 h have passed. `sweep -n` never acts; `sweep -A` acts immediately but still
-requires the armed flag.
+requires the armed flag. `maintenance_only = true` keeps folder removals dry-run
+even with an armed flag or `sweep -A`, while permitting opted-in native hooks.
 
 **Space floor.** Below the host's floor, safe folders go least-recently-used first,
 even before their TTL, until the target. Default floor 30 GB, target floor + 20 GB;
@@ -248,8 +249,11 @@ reclaimable maintenance -n
 reclaimable maintenance --only uv --force-due
 ```
 
-Hooks require both a valid host armed state past its 24-hour grace and the explicit
-config opt-in `maintenance_armed = true`. Otherwise they report a dry run.
+Hooks require the explicit config opt-in `maintenance_armed = true`. By default,
+they also require a valid host armed state past its 24-hour grace. Setting
+`maintenance_only = true` allows hooks without arming folder removal or waiting
+for that grace; folder removals stay dry-run even if the host is armed or
+`sweep -A` is used. Otherwise hooks report a dry run.
 `sweep -n` and `maintenance -n` never run cleanup commands. `sweep -A` does not
 bypass maintenance's grace period. `--force-due` ignores only cadence; it does not
 bypass arming, free-space triggers, busy holders or in-use checks.
@@ -261,10 +265,12 @@ tool is logged and skipped. Configure only trusted native commands and arguments
 Native tools own their cleanup policy; marker TTL/deny checks do not govern what
 a configured native tool removes.
 
-Add entries like these to `config.toml` (all opt out by default):
+Add entries like these to `config.toml` (all opt out by default), or adapt
+[config.example.toml](config.example.toml):
 
 ```toml
 maintenance_armed = false  # top-level; true is a separate explicit opt-in
+maintenance_only = false   # top-level; true keeps folder removals dry-run
 busy_holders = ["scheduler"]  # all maintenance hooks must pass this check
 
 [[maintenance]]
@@ -307,10 +313,11 @@ timeout = 30             # holder timeouts are seconds
 
 [hosts.worker]
 maintenance_armed = false
+maintenance_only = true  # overrides the global value; still requires maintenance_armed
 maintenance = []         # replaces the global list; [] disables all hooks here
 ```
 
-Host sections may override `maintenance_armed` and replace the entire
+Host sections may override `maintenance_armed`, `maintenance_only` and replace the entire
 `maintenance` list, using `[[hosts.worker.maintenance]]` for host entries. Names
 must be unique within the effective host list. Cache locations vary by tool and
 host; declare checks only where the tool needs them. The Docker example
@@ -333,6 +340,8 @@ an unambiguous no-match for each existing declared directory, and `pgrep -x` mus
 report no process with the exact declared name. Missing probes, unreadable paths,
 warnings, failures and timeouts skip the hook. These checks are snapshots; native
 tools must still implement their own concurrency protection.
+`maintenance_only` changes only arming policy; busy holders, declared in-use
+checks, cadence, free-space triggers and timeouts still apply.
 
 `busy_holders` references uniquely named command `[[holder]]` entries. A top-level
 list applies to every hook; a hook's own list adds checks. Host sections can

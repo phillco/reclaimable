@@ -157,7 +157,7 @@ func (a *App) applyHostSection(raw map[string]any) (map[string]any, error) {
 			}
 		}
 	}
-	for _, k := range []string{"floor", "floor_gb", "target", "target_gb", "move_root", "roots", "volume_floors", "maintenance", "maintenance_armed", "busy_holders"} {
+	for _, k := range []string{"floor", "floor_gb", "target", "target_gb", "move_root", "roots", "volume_floors", "maintenance", "maintenance_armed", "maintenance_only", "busy_holders"} {
 		if v, ok := mine[k]; ok {
 			out[k] = v
 		}
@@ -315,11 +315,19 @@ func (a *App) loadConfig(path string) (*Config, error) {
 	if truth(raw["exclude_list_path"]) {
 		export = a.expand(textValue(raw["exclude_list_path"]))
 	}
+	maintenanceOnly := false
+	if v, exists := raw["maintenance_only"]; exists {
+		var ok bool
+		maintenanceOnly, ok = v.(bool)
+		if !ok {
+			return nil, errors.New("maintenance_only must be true or false")
+		}
+	}
 	maintenance, maintenanceArmed, e := parseMaintenance(raw, holders)
 	if e != nil {
 		return nil, e
 	}
-	return &Config{Maintenance: maintenance, MaintenanceArmed: maintenanceArmed, Roots: roots, Floor: floor, Target: target, MoveRoot: textValue(raw["move_root"]), DenyPaths: append(append([]string{}, denyPaths...), dps...), DenyNames: append(append([]string{}, denyNames...), dns...), DenyExact: append(append([]string{}, broad...), dex...), DenySequences: sequences, VolumeFloors: volumes, Holders: holders, JobDone: jobDone, ExportList: export, ExportFormat: format, RemoteCommand: remote, SessionGrace: grace}, nil
+	return &Config{Maintenance: maintenance, MaintenanceArmed: maintenanceArmed, MaintenanceOnly: maintenanceOnly, Roots: roots, Floor: floor, Target: target, MoveRoot: textValue(raw["move_root"]), DenyPaths: append(append([]string{}, denyPaths...), dps...), DenyNames: append(append([]string{}, denyNames...), dns...), DenyExact: append(append([]string{}, broad...), dex...), DenySequences: sequences, VolumeFloors: volumes, Holders: holders, JobDone: jobDone, ExportList: export, ExportFormat: format, RemoteCommand: remote, SessionGrace: grace}, nil
 }
 func contains(items []string, s string) bool {
 	for _, x := range items {

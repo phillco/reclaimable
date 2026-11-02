@@ -1,0 +1,25 @@
+# Native maintenance is disabled until explicitly opted in.
+maintenance_armed = false
+maintenance_only = false  # true permits opted-in hooks and keeps folder removals dry-run
+
+[[maintenance]]
+name = "uv"
+command = ["uv", "cache", "prune"]
+every = "24h"
+timeout = "20m"
+# No in_use: uv cache prune takes uv's own cache lock.
+
+[[maintenance]]
+name = "brew"
+command = ["brew", "cleanup"]
+every = "7d"
+# No in_use: brew cleanup uses its own locking.
+
+# Optional checks for a tool that needs external protection:
+# in_use = { lockfiles = ["~/.cache/mytool/cleanup.lock"], lsof = ["~/.cache/mytool"], processes = ["mytool"] }
+
+# Per-host overrides use the lowercase first label of the hostname.
+[hosts.worker]
+maintenance_armed = false
+maintenance_only = true
+# maintenance = []  # uncomment to disable all hooks on this host

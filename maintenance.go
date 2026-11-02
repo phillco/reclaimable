@@ -248,9 +248,9 @@ func (a *App) inspectMaintenance(args Args, cfg *Config, h Maintenance, last map
 		return row, ""
 	}
 	armed, mode := a.armedState()
-	if !armed || !cfg.MaintenanceArmed || args.DryRun {
+	if (!armed && !cfg.MaintenanceOnly) || !cfg.MaintenanceArmed || args.DryRun {
 		row.Status, row.Detail = "dry-run", "would run"
-		if !armed {
+		if !armed && !cfg.MaintenanceOnly {
 			row.Detail += ": " + mode
 		} else if !cfg.MaintenanceArmed {
 			row.Detail += ": maintenance_armed is false"
