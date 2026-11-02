@@ -733,6 +733,53 @@ def _paths_in(value) -> list[Path]:
     return out
 
 
+class Unreadable(Exception):
+    pass
+
+
+def list_dir(path: Path) -> list[os.DirEntry]:
+    """Entries of `path`; [] if it does not exist; Unreadable if it can't be listed."""
+    try:
+        return list(os.scandir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError as e:
+        raise Unreadable(f"{path}: {e.strerror}") from e
+
+
+def expand_dirs(pattern: str) -> list[Path]:
+    """Directories matching a path or glob, raising Unreadable (never silently
+    skipping) when a directory on the way can't be listed."""
+    parts = Path(pattern).expanduser().parts
+    found = [Path(parts[0])] if parts else []
+    for part in parts[1:]:
+        nxt: list[Path] = []
+        for base in found:
+            if glob.has_magic(part):
+                nxt += [
+                    Path(e.path)
+                    for e in sorted(list_dir(base), key=lambda e: e.name)
+                    if fnmatch.fnmatchcase(e.name, part)
+                ]
+            else:
+                nxt.append(base / part)
+        found = nxt
+    out = []
+    for p in found:
+        try:
+            os.stat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            raise Unreadable(f"{p}: {e.strerror}") from e
+        out.append(p)
+    return out
+
+
+def json_files(path: Path) -> list[Path]:
+    return sorted(Path(e.path) for e in list_dir(path) if e.name.endswith(".json"))
+
+
 def lease_hold(holder: dict, marker: Marker) -> str | None:
     """Live leases (JSON files with pid/job/log/what) that reference the folder or its job.
 
@@ -748,18 +795,19 @@ def lease_hold(holder: dict, marker: Marker) -> str | None:
     if isinstance(lease_dirs, str):
         lease_dirs = [lease_dirs]
     dirs: list[Path] = []
-    for pattern in lease_dirs:
-        dirs += [Path(p) for p in sorted(glob.glob(str(Path(pattern).expanduser())))]
+    try:
+        for pattern in lease_dirs:
+            dirs += expand_dirs(pattern)
+    except Unreadable as e:
+        return f"lease dir unreadable ({e})"
     claim_dirs = holder.get("claim_dir", [])
     claim_dirs = [claim_dirs] if isinstance(claim_dirs, str) else claim_dirs
     claim_dirs = [expand(p) for p in claim_dirs]
     for lease_dir in dirs:
-        if not lease_dir.exists():
-            continue
         try:
-            files = sorted(lease_dir.glob("*.json"))
-        except OSError as e:
-            return f"lease dir unreadable ({lease_dir}: {e.strerror})"
+            files = json_files(lease_dir)
+        except Unreadable as e:
+            return f"lease dir unreadable ({e})"
         for path in files:
             try:
                 lease = json.loads(path.read_text())
@@ -779,14 +827,13 @@ def lease_hold(holder: dict, marker: Marker) -> str | None:
             if claim:
                 for claim_dir in claim_dirs:
                     rec_path = claim_dir / f"{claim}.json"
-                    if rec_path.exists():
-                        try:
-                            rec = json.loads(rec_path.read_text())
-                        except (OSError, ValueError):
-                            return f"unreadable claim record {rec_path.name}"
-                        refs += _paths_in(rec.get("cwd")) + _paths_in(
-                            rec.get("command")
-                        )
+                    try:
+                        rec = json.loads(rec_path.read_text())
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError):
+                        return f"unreadable claim record {rec_path.name}"
+                    refs += _paths_in(rec.get("cwd")) + _paths_in(rec.get("command"))
             cwd = process_cwd(pid)
             if cwd:
                 refs.append(cwd)
@@ -795,9 +842,11 @@ def lease_hold(holder: dict, marker: Marker) -> str | None:
                     return f"{name} uses {ref}"
     # Claims still starting (no lease yet).
     for claim_dir in claim_dirs:
-        if not claim_dir.exists():
-            continue
-        for rec_path in claim_dir.glob("*.json"):
+        try:
+            recs = json_files(claim_dir)
+        except Unreadable as e:
+            return f"claim dir unreadable ({e})"
+        for rec_path in recs:
             try:
                 rec = json.loads(rec_path.read_text())
             except (OSError, ValueError):
@@ -902,6 +951,7 @@ def job_closed(
     hit = cache.get(job)
     if hit and hit.get("closed") and now() - hit.get("checked", 0) < 3600:
         return True, hit.get("closed_at"), "closed"
+    first_seen = (hit or {}).get("first_closed_seen")
     cmd = [_fill(a, job=job) for a in cfg.job_done["command"]]
     env = {**os.environ, "RECLAIMABLE_JOB": job}
     try:
@@ -925,12 +975,23 @@ def job_closed(
         if closed and res.stdout.strip()
         else None
     )
-    cache[job] = {"closed": closed, "closed_at": closed_at, "checked": now()}
+    record = {"closed": closed, "closed_at": closed_at, "checked": now()}
+    if closed and closed_at is None:
+        # No usable close time: count from the first time we saw it closed (kept in
+        # the registry), never from the marker's older mtime.
+        first_seen = first_seen or now()
+        record["first_closed_seen"] = first_seen
+        closed_at = record["closed_at"] = first_seen
+    cache[job] = record
     return closed, closed_at, "closed" if closed else "open"
 
 
-def session_running(session: str) -> bool | None:
-    """True (alive), False (gone), or None (unknown).
+NO_MATCH = "no-match"
+
+
+def session_running(session: str) -> bool | str | None:
+    """True (alive), False (gone), NO_MATCH (the process list was searched successfully
+    and nothing matched), or None (unknown: the search could not be done).
 
     A numeric session is a pid and is checked exactly. Any other id is matched
     against the process list; a miss does not prove the session ended (its id may
@@ -947,7 +1008,7 @@ def session_running(session: str) -> bool | None:
     if res.returncode not in (0, 1):
         return None
     pids = [int(p) for p in res.stdout.split() if p.isdigit() and int(p) != os.getpid()]
-    return True if pids else None
+    return True if pids else NO_MATCH
 
 
 def _changes(output: str, porcelain: bool = False) -> list[str]:
@@ -1162,7 +1223,7 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
     if m.session:
         running = session_running(m.session)
         if (
-            running is None
+            running == NO_MATCH
             and cfg.session_grace is not None
             and m.job
             and not m.session.isdigit()
@@ -1184,7 +1245,7 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
                 return v
             running = False
             entry.setdefault("session_exit_seen", ready)
-        if running is None:
+        if running is None or running == NO_MATCH:
             v.reason = f"session {m.session[:12]} state unknown"
             entry.pop("session_exit_seen", None)
             return v

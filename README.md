@@ -65,12 +65,16 @@ completed keeps the folder (fail closed):
 2. **Holds**: any entry in `holds` keeps the folder.
 3. **Live readers**: `lsof +D` (90 s cap) must show nothing open under it.
 4. **Holders** (config): external commands and lease directories that can veto a
-   folder, see below. Unreadable lease state keeps every folder.
+   folder, see below. Unreadable lease state (an unlistable lease, claim or glob-parent directory,
+   or an unparseable file) keeps every folder.
 5. **Job-tied data** (`job`): the `job_done` command must report the job closed,
    and the `session` (a pid, or text matched against the process list) must be
    gone. A numeric session is checked exactly; a non-numeric one is only known to
    be alive when found, so a miss keeps the folder as "unknown" unless
-   `session_grace` is set (see below).
+   `session_grace` is set (see below), which applies only after a successful
+   process-list search found nothing (a failed or missing `pgrep` keeps the folder).
+   If `job_done` reports closed without a time, the first time the janitor saw it
+   closed (stored in the registry) is used for the grace and the TTL.
 6. **Worktrees**: anything with `.git`/`.jj` at its top, and any repo nested inside
    a marked folder (also in `mirror` folders), is refused when dirty or with
    unpushed commits. Primary repositories are never removed, only linked git

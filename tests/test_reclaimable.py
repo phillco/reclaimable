@@ -828,19 +828,114 @@ def test_session_grace_elapsed_counts_as_gone(env, monkeypatch):
     assert 6.9 * DAY < time.time() - v.clock_start < 7.1 * DAY
 
 
-def test_session_grace_missing_close_time_keeps(env, monkeypatch):
+def test_missing_close_time_counts_from_first_observation(env, monkeypatch):
     env.cfg.session_grace = 72 * 3600
     set_job(env, "5", "closed")  # closed, no timestamp
     fake_pgrep(monkeypatch, 1)
-    v = rc.evaluate(
-        make(env, "j", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
+    f = make(env, "j", age_s=30 * DAY, job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    # old marker mtime must not make it expire the moment the close is first seen
+    assert not v.safe and "within grace" in v.reason
+    first = env.reg["jobs"]["5"]["first_closed_seen"]
+    # later sweeps keep the first-observed time (even after the 1h cache expires)
+    env.reg["jobs"]["5"]["checked"] -= 7200
+    rc.evaluate(f, env.cfg, env.reg)
+    assert env.reg["jobs"]["5"]["first_closed_seen"] == first
+    # once the grace has passed since first observation, it is eligible
+    env.reg["jobs"]["5"].update(
+        first_closed_seen=first - 4 * DAY, closed_at=first - 4 * DAY
     )
-    assert not v.safe and "close time unavailable" in v.reason
-    set_job(env, "5", "closed garbage")
-    env.reg["jobs"] = {}
-    assert not rc.evaluate(
-        make(env, "k", age_s=30 * DAY, job="5", session="sess-x"), env.cfg, env.reg
-    ).safe
+    assert rc.evaluate(f, env.cfg, env.reg).safe
+    # garbled timestamps behave the same
+    set_job(env, "6", "closed garbage")
+    g = rc.evaluate(
+        make(env, "k", age_s=30 * DAY, job="6", session="sess-x"), env.cfg, env.reg
+    )
+    assert not g.safe and "within grace" in g.reason
+
+
+def test_missing_close_time_ttl_counts_from_first_observation(env):
+    set_job(env, "7", "closed")
+    f = make(env, "t", age_s=30 * DAY, job="7", kind="scratch")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and not v.expired, (
+        "old scratch must not expire the moment a close is seen"
+    )
+
+
+def test_session_grace_requires_successful_nomatch_probe(env, monkeypatch):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    f = make(env, "j", age_s=30 * DAY, job="5", session="sess-x")
+    # pgrep unavailable
+    monkeypatch.setattr(rc.shutil, "which", lambda name: None)
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+    # pgrep fails (exit 2)
+    fake_pgrep(monkeypatch, 2)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "unknown" in v.reason
+
+    # pgrep times out
+    def boom(cmd, timeout=60, cwd=None):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(rc, "run", boom)
+    assert not rc.evaluate(f, env.cfg, env.reg).safe
+    # a clean no-match probe is what lets the grace apply
+    fake_pgrep(monkeypatch, 1)
+    assert rc.evaluate(f, env.cfg, env.reg).safe
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores modes")
+def test_unreadable_lease_and_claim_dirs_fail_closed(env):
+    f = make(env, "x", age_s=9 * DAY)
+    leases = env.root / "leases"
+    leases.mkdir()
+    (leases / "1.json").write_text(json.dumps({"pid": os.getpid(), "what": str(f)}))
+    leases.chmod(0)
+    try:
+        v = rc.evaluate(f, env.cfg, env.reg)
+        assert not v.safe and "unreadable" in v.reason
+    finally:
+        leases.chmod(0o755)
+    claims = env.root / "claims"
+    claims.mkdir()
+    (claims / "a.json").write_text(
+        json.dumps({"state": "running", "pid": os.getpid(), "cwd": str(f)})
+    )
+    claims.chmod(0)
+    try:
+        v = rc.evaluate(f, env.cfg, env.reg)
+        assert not v.safe and "unreadable" in v.reason
+    finally:
+        claims.chmod(0o755)
+    # a claim_id whose record sits in an unreadable dir
+    (leases / "1.json").write_text(json.dumps({"pid": os.getpid(), "claim_id": "a"}))
+    claims.chmod(0)
+    try:
+        assert not rc.evaluate(f, env.cfg, env.reg).safe
+    finally:
+        claims.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores modes")
+def test_unreadable_dir_inside_lease_glob_fails_closed(env):
+    f = make(env, "x", age_s=9 * DAY)
+    base = env.root / "homes"
+    (base / "u1/leases").mkdir(parents=True)
+    (base / "u2").mkdir()
+    env.cfg.holders = [{"lease_dir": str(base / "*/leases")}]
+    assert rc.evaluate(f, env.cfg, env.reg).safe  # u2 has no lease dir: fine
+    (base / "u2").chmod(0)  # can't tell whether u2/leases exists
+    try:
+        assert not rc.evaluate(f, env.cfg, env.reg).safe
+    finally:
+        (base / "u2").chmod(0o755)
+    base.chmod(0)
+    try:
+        assert not rc.evaluate(f, env.cfg, env.reg).safe
+    finally:
+        base.chmod(0o755)
 
 
 def test_session_grace_needs_closed_job_and_ignores_pids_and_live_hits(
