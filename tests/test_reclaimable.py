@@ -1095,3 +1095,87 @@ def test_job_label_added_during_move_keeps_source(env, monkeypatch):
     monkeypatch.setattr(rc, "move_and_verify", slow)
     ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
     assert not ok and f.exists() and "job 9" in detail
+
+
+# --- session state is re-decided right before removal ---------------------------
+
+
+def test_numeric_session_alive_after_evaluation_blocks_removal(env):
+    import subprocess as sp
+
+    p = sp.Popen(["sleep", "30"])
+    p.kill()
+    p.wait()  # a pid that is now dead
+    f = make(env, "ss1", age_s=30 * DAY, session=str(p.pid))
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe, v.reason
+    live = sp.Popen(["sleep", "30"])
+    try:
+        # the marker is edited to name a live pid
+        m = json.loads((f / ".reclaimable").read_text())
+        m["session"] = str(live.pid)
+        (f / ".reclaimable").write_text(json.dumps(m))
+        old = v.marker.mtime
+        os.utime(f / ".reclaimable", (old, old))
+        ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+        assert not ok and f.exists() and "still running" in detail
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_session_appearing_alive_between_evaluate_and_removal_is_kept(env, monkeypatch):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    f = make(env, "ss2", age_s=30 * DAY, job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe, v.reason
+    fake_pgrep(monkeypatch, 0)  # the session shows up again
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "still running" in detail
+
+
+@pytest.mark.parametrize("code", [2, None])
+def test_session_probe_failing_at_removal_is_kept(env, monkeypatch, code):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    f = make(env, "ss3", age_s=30 * DAY, job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe, v.reason
+    if code is None:
+        monkeypatch.setattr(rc.shutil, "which", lambda name: None)
+    else:
+        fake_pgrep(monkeypatch, code)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "unknown" in detail
+
+
+def test_session_alive_during_move_keeps_source(env, monkeypatch):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    f, dest = make_movable(env, "ss4", job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert v.safe and v.action == "move", v.reason
+    real = rc.move_and_verify
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        fake_pgrep(monkeypatch, 0)
+        return out
+
+    monkeypatch.setattr(rc, "move_and_verify", slow)
+    ok, detail = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert not ok and f.exists() and "still running" in detail
+
+
+def test_session_still_gone_at_removal_removes(env, monkeypatch):
+    env.cfg.session_grace = 3600
+    set_job(env, "5", f"closed {iso_ago(30 * DAY)}")
+    fake_pgrep(monkeypatch, 1)
+    f = make(env, "ss5", age_s=30 * DAY, job="5", session="sess-x")
+    v = rc.evaluate(f, env.cfg, env.reg)
+    ok, _ = rc.remove_folder(v, True, env.cfg, env.reg)
+    assert ok and not f.exists()

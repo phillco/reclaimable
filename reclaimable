@@ -1198,6 +1198,47 @@ class Verdict:
         }
 
 
+def session_problem(
+    m: Marker, cfg: Config, entry: dict, closed_at: float | None
+) -> str | None:
+    """Why the marker's session isn't known to be gone (None when it is; the time it
+    was first seen gone is then in entry["session_exit_seen"]).
+
+    A numeric session is a pid, checked exactly. A non-numeric one counts as gone
+    only after a successful process-list search found nothing AND `session_grace`
+    has elapsed since the job's (recorded or first observed) close time."""
+    assert m.session
+    label = m.session[:12]
+    running = session_running(m.session)
+    if (
+        running == NO_MATCH
+        and cfg.session_grace is not None
+        and m.job
+        and not m.session.isdigit()
+    ):
+        if not closed_at:
+            entry.pop("session_exit_seen", None)
+            return f"session {label} unknown and job close time unavailable"
+        ready = closed_at + cfg.session_grace
+        if now() < ready:
+            entry.pop("session_exit_seen", None)
+            return (
+                f"session {label} within grace "
+                f"(job closed {human_age(now() - closed_at)} ago, "
+                f"grace {human_age(cfg.session_grace)})"
+            )
+        running = False
+        entry.setdefault("session_exit_seen", ready)
+    if running is None or running == NO_MATCH:
+        entry.pop("session_exit_seen", None)
+        return f"session {label} state unknown"
+    if running:
+        entry.pop("session_exit_seen", None)
+        return f"session {label} still running"
+    entry.setdefault("session_exit_seen", now())
+    return None
+
+
 def tree_problem(
     folder: Path, m: Marker, cfg: Config, w: Walk
 ) -> tuple[str | None, str | None]:
@@ -1266,39 +1307,10 @@ def evaluate(folder: Path, cfg: Config, reg: dict, deep: bool = True) -> Verdict
             return v
         start = max(start, closed_at or 0)
     if m.session:
-        running = session_running(m.session)
-        if (
-            running == NO_MATCH
-            and cfg.session_grace is not None
-            and m.job
-            and not m.session.isdigit()
-        ):
-            # Non-pid session that can't be observed: gone once the job has been
-            # closed for `session_grace` (measured from the job's close time).
-            if not closed_at:
-                v.reason = f"session {m.session[:12]} unknown and job close time unavailable"
-                entry.pop("session_exit_seen", None)
-                return v
-            ready = closed_at + cfg.session_grace
-            if now() < ready:
-                v.reason = (
-                    f"session {m.session[:12]} within grace "
-                    f"(job closed {human_age(now() - closed_at)} ago, "
-                    f"grace {human_age(cfg.session_grace)})"
-                )
-                entry.pop("session_exit_seen", None)
-                return v
-            running = False
-            entry.setdefault("session_exit_seen", ready)
-        if running is None or running == NO_MATCH:
-            v.reason = f"session {m.session[:12]} state unknown"
-            entry.pop("session_exit_seen", None)
+        reason = session_problem(m, cfg, entry, closed_at)
+        if reason:
+            v.reason = reason
             return v
-        if running:
-            v.reason = f"session {m.session[:12]} still running"
-            entry.pop("session_exit_seen", None)
-            return v
-        entry.setdefault("session_exit_seen", now())
         start = max(start, entry["session_exit_seen"])
     v.clock_start = start
     v.expired = now() - start >= v.ttl_s
@@ -1523,10 +1535,16 @@ def remove_folder(v: Verdict, armed: bool, cfg: Config, reg: dict) -> tuple[bool
             return busy
         # Job state may have changed (reopened, keep/hold label, helper failing):
         # ask again, bypassing the cache.
+        closed_at = None
         if fresh.job:
-            closed, _, detail = job_closed(fresh.job, cfg, reg, fresh=True)
+            closed, closed_at, detail = job_closed(fresh.job, cfg, reg, fresh=True)
             if not closed:
                 return f"job {fresh.job} {detail if closed is False else 'state unknown: ' + detail}"
+        if fresh.session:
+            entry = reg["markers"].setdefault(str(v.folder), {"registered": now()})
+            reason = session_problem(fresh, cfg, entry, closed_at)
+            if reason:
+                return reason
         # Repeat the worktree checks: work may have been added since evaluation
         # (or during a long copy) that the original verdict never saw.
         w = walk(v.folder, cfg, check_names=True)
