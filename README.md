@@ -8,10 +8,13 @@ launchd/cron/systemd) removes or moves expired folders and frees space
 least-recently-used first when a disk runs low. It only touches folders that pass
 every safety check, and it does nothing until you arm the host.
 
-Single-file Python 3.11+, standard library only.
+Single Go executable for macOS/Linux (amd64/arm64), Go 1.22+. The only library
+dependency is pinned and vendored: `github.com/BurntSushi/toml` v1.4.0.
 
 ```sh
-uv tool install git+https://github.com/OWNER/reclaimable   # or copy ./reclaimable onto PATH
+go build                       # produces ./reclaimable
+mkdir -p ~/.local/bin
+install -m 755 ./reclaimable ~/.local/bin/reclaimable
 reclaimable mark ~/proj/.cache -o mytool -r "mytool build recreates it" -t 3d
 reclaimable ls                  # age, size, TTL, eligibility and why
 reclaimable sweep -n            # dry run
@@ -232,12 +235,55 @@ exclude_list_format = "{path}"       # one line per folder; e.g. "path {path}"
 remote_command = ["ssh", "{host}", "{script}"]
 ```
 
-## Tests
+## Build and tests
 
 ```sh
-uv run --no-project --with pytest python -m pytest
+go build                       # uses vendor/, no network needed
+go test ./...                  # parity requires Python 3.11+
+go vet ./...
+gofmt -l *.go
+(cd python && uv run --no-project --with pytest python -m pytest)
+uv run --no-project --with pytest python -m pytest python/upstream/tests
 ```
+
+Copy `completions/reclaimable.fish` into a Fish completion directory. The binary
+name, subcommands and flags remain `reclaimable`.
+
+The original Python reference and 75 cases remain unchanged under `python/`.
+The separate `python/upstream/` snapshot includes later reviewed safeguards and
+183 cases. `PORT-NOTES.md` maps every Python test function to Go. Tests use temporary
+trees/homes/state for destructive scenarios, and local shims for remote protocols.
+Parity compares outputs, exits and resulting state; only fixture roots, clocks
+and free-space measurements are normalized.
+
+## Differences from the Python version
+
+- Help layout, parser/OS/JSON diagnostics, JSON key order and escaping differ.
+  Flags, TOML keys, marker/state schemas and ordinary command exits are compatible.
+- Unicode comparison uses pinned Unicode 16.0.0 data. Another Python database can
+  differ for newly assigned characters. Regenerate with
+  `python3 tools/generate_unicode.py` using a matching database, or verify using
+  `python3 tools/generate_unicode.py --check`. See `UNICODE-LICENSE.txt`.
+- Malformed lease/claim objects and holder-directory settings keep data instead
+  of raising exceptions. Size overflow is rejected; invalid/nonfinite arming times
+  and descendant stat failures keep data. File/directory changes during hashing
+  veto verification. Timeouts also bound process groups/pipes.
+- Descriptor operations support macOS/Linux on amd64/arm64. Other architectures
+  keep data. Linux symlink metadata inspection needs procfs; unavailable inspection
+  keeps the source. No native copy utility is required.
+- Local copies retain full mode bits/macOS flags beyond the updated Python copy's
+  ordinary permission bits. Both refuse unverifiable extended payloads, including
+  resource forks, except system provenance.
+- Remote export uses verified TAR in an unlinked temporary descriptor; Python
+  first builds a private snapshot tree. Both use the same descriptor-safe receiver
+  and JSON inventory; malformed/duplicate inventories are refused.
+- The unreadable-claim test isolates claims from an earlier live lease, fixing a
+  masking assertion while preserving its intended scenario.
+
+Local runtime needs no Python. External `lsof`, `pgrep`, `git` and `jj` retain
+their existing roles; remote endpoints need Python 3 and the configured remote
+command. Building, installing and running tests do not arm the real host.
 
 ## License
 
-MIT
+MIT; vendored TOML and generated Unicode data retain their included licenses.
