@@ -1,0 +1,845 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+func (a *App) openFiles(folder string) string {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		return "lsof unavailable"
+	}
+	r := a.Run([]string{"lsof", "-w", "-n", "-P", "-F", "pcn", "+D", folder}, 90, "", nil)
+	if r.Timeout {
+		return "lsof timed out"
+	}
+	if r.Err != nil || r.Code != 0 && r.Code != 1 {
+		return fmt.Sprintf("lsof failed (%d)", r.Code)
+	}
+	procs := map[string]bool{}
+	pid := "None"
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		if strings.HasPrefix(line, "p") {
+			pid = line[1:]
+		} else if strings.HasPrefix(line, "c") {
+			procs[line[1:]+"["+pid+"]"] = true
+		}
+	}
+	if strings.TrimSpace(r.Stdout) != "" {
+		names := sortedKeys(procs)
+		if len(names) > 5 {
+			names = names[:5]
+		}
+		if len(names) == 0 {
+			names = []string{"?"}
+		}
+		return "open files: " + strings.Join(names, ", ")
+	}
+	return ""
+}
+func (a *App) processCwd(pid int) string {
+	r := a.Run([]string{"lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn"}, 15, "", nil)
+	if r.Err != nil || r.Timeout {
+		return ""
+	}
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		if strings.HasPrefix(line, "n/") {
+			return line[1:]
+		}
+	}
+	return ""
+}
+
+var pathTokens = regexp.MustCompile(`[\s=:]+`)
+
+func (a *App) pathsIn(value any) []string {
+	var out []string
+	switch v := value.(type) {
+	case string:
+		if strings.Contains(v, "/") || strings.HasPrefix(v, "~") {
+			for _, token := range pathTokens.Split(v, -1) {
+				if strings.HasPrefix(token, "/") || strings.HasPrefix(token, "~/") {
+					out = append(out, a.expand(token))
+				}
+			}
+		}
+	case []any:
+		for _, x := range v {
+			out = append(out, a.pathsIn(x)...)
+		}
+	case []string:
+		for _, x := range v {
+			out = append(out, a.pathsIn(x)...)
+		}
+	}
+	return out
+}
+func listDir(path string) ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(path)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil
+	}
+	return entries, err
+}
+func (a *App) expandDirs(pattern string) ([]string, error) {
+	p := a.expand(pattern)
+	var found []string
+	parts := strings.Split(p, string(filepath.Separator))
+	if filepath.IsAbs(p) {
+		found = []string{string(filepath.Separator)}
+		parts = parts[1:]
+	} else {
+		found = []string{parts[0]}
+		parts = parts[1:]
+	}
+	for _, part := range parts {
+		var next []string
+		for _, base := range found {
+			if strings.ContainsAny(part, "*?[") {
+				entries, err := listDir(base)
+				if err != nil {
+					return nil, err
+				}
+				for _, e := range entries {
+					if globMatch(e.Name(), part) {
+						next = append(next, filepath.Join(base, e.Name()))
+					}
+				}
+			} else {
+				next = append(next, filepath.Join(base, part))
+			}
+		}
+		found = next
+	}
+	var out []string
+	for _, p := range found {
+		_, err := os.Stat(p)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+func jsonFiles(path string) ([]string, error) {
+	entries, err := listDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			out = append(out, filepath.Join(path, e.Name()))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+func pathList(v any) ([]string, bool) {
+	if v == nil {
+		return nil, true
+	}
+	if s, ok := v.(string); ok {
+		return []string{s}, true
+	}
+	return stringList(v)
+}
+func readObject(path string) (map[string]any, error) {
+	v, err := loadJSON(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	m := dict(v)
+	if m == nil {
+		return nil, fmt.Errorf("not a JSON object")
+	}
+	return m, nil
+}
+func validPID(v any) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int(x), true
+	case int:
+		return x, true
+	case int64:
+		return int(x), true
+	case string:
+		n, e := strconv.Atoi(x)
+		return n, e == nil
+	case bool:
+		if x {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+func (a *App) leaseHold(holder map[string]any, m *Marker) string {
+	job := strings.TrimLeft(m.Job, "#")
+	patterns, ok := pathList(holder["lease_dir"])
+	if !ok {
+		return "lease dir unreadable (invalid lease_dir)"
+	}
+	var dirs []string
+	for _, pattern := range patterns {
+		matches, err := a.expandDirs(pattern)
+		if err != nil {
+			return fmt.Sprintf("lease dir unreadable (%s)", err)
+		}
+		dirs = append(dirs, matches...)
+	}
+	claims, ok := pathList(holder["claim_dir"])
+	if !ok {
+		return "claim dir unreadable (invalid claim_dir)"
+	}
+	for i := range claims {
+		claims[i] = a.expand(claims[i])
+	}
+	for _, d := range dirs {
+		files, err := jsonFiles(d)
+		if err != nil {
+			return fmt.Sprintf("lease dir unreadable (%s)", err)
+		}
+		for _, path := range files {
+			lease, err := readObject(path)
+			if err != nil {
+				return "unreadable lease " + filepath.Base(path)
+			}
+			pid, ok := validPID(lease["pid"])
+			if !ok {
+				return "unreadable lease " + filepath.Base(path)
+			}
+			if !pidAlive(pid) {
+				continue
+			}
+			leaseJob := textValue(lease["job"])
+			if !truth(lease["job"]) {
+				leaseJob = "?"
+			}
+			name := "lease " + filepath.Base(path) + " (" + leaseJob + ")"
+			if job != "" && (job == textValue(lease["job"]) || job == textValue(lease["issue"])) {
+				return name + " is this job"
+			}
+			refs := append(a.pathsIn(lease["log"]), a.pathsIn(lease["what"])...)
+			if claim := lease["claim_id"]; truth(claim) {
+				for _, dir := range claims {
+					recPath := filepath.Join(dir, textValue(claim)+".json")
+					if _, err := os.Stat(recPath); errors.Is(err, os.ErrNotExist) {
+						continue
+					}
+					rec, err := readObject(recPath)
+					if err != nil {
+						return "unreadable claim record " + filepath.Base(recPath)
+					}
+					refs = append(refs, a.pathsIn(rec["cwd"])...)
+					refs = append(refs, a.pathsIn(rec["command"])...)
+				}
+			}
+			if cwd := a.ProcessCwd(pid); cwd != "" {
+				refs = append(refs, cwd)
+			}
+			for _, ref := range refs {
+				if related(ref, m.Folder) {
+					return name + " uses " + ref
+				}
+			}
+		}
+	}
+	for _, dir := range claims {
+		files, err := jsonFiles(dir)
+		if err != nil {
+			return fmt.Sprintf("claim dir unreadable (%s)", err)
+		}
+		for _, path := range files {
+			rec, err := readObject(path)
+			if err != nil {
+				return "unreadable claim record " + filepath.Base(path)
+			}
+			state := textValue(rec["state"])
+			if state != "starting" && state != "running" {
+				continue
+			}
+			if state == "running" && truth(rec["pid"]) {
+				pid, ok := validPID(rec["pid"])
+				if !ok {
+					return "unreadable claim record " + filepath.Base(path)
+				}
+				if !pidAlive(pid) {
+					continue
+				}
+			}
+			refs := append(a.pathsIn(rec["cwd"]), a.pathsIn(rec["command"])...)
+			for _, ref := range refs {
+				if related(ref, m.Folder) {
+					return "claim " + strings.TrimSuffix(filepath.Base(path), ".json") + " uses " + ref
+				}
+			}
+		}
+	}
+	return ""
+}
+func (a *App) fill(arg string, values map[string]string) string {
+	if strings.HasPrefix(arg, "~/") {
+		arg = a.expand(arg)
+	}
+	p, err := filepath.Abs(a.ConfigFile)
+	if err != nil {
+		p = a.ConfigFile
+	}
+	if real, e := filepath.EvalSymlinks(p); e == nil {
+		p = real
+	}
+	arg = strings.ReplaceAll(arg, "{config_dir}", filepath.Dir(p))
+	for k, v := range values {
+		arg = strings.ReplaceAll(arg, "{"+k+"}", v)
+	}
+	return arg
+}
+func withEnv(values map[string]string) []string {
+	env := os.Environ()
+	for k, v := range values {
+		key := "RECLAIMABLE_" + strings.ToUpper(k) + "="
+		var next []string
+		for _, s := range env {
+			if !strings.HasPrefix(s, key) {
+				next = append(next, s)
+			}
+		}
+		env = append(next, key+v)
+	}
+	return env
+}
+func (a *App) filledCommand(raw any, values map[string]string) ([]string, bool) {
+	cmd, ok := stringList(raw)
+	if !ok || len(cmd) == 0 {
+		return nil, false
+	}
+	out := make([]string, len(cmd))
+	for i, s := range cmd {
+		out[i] = a.fill(s, values)
+	}
+	return out, true
+}
+func timeoutValue(m map[string]any, fallback float64) float64 {
+	if v, ok := m["timeout"]; ok {
+		n := number(v)
+		if n < 0 {
+			return 0
+		}
+		return n
+	}
+	return fallback
+}
+func shortText(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n])
+	}
+	return s
+}
+func firstLine(s string) string { return strings.Split(s, "\n")[0] }
+func (a *App) commandHold(holder map[string]any, m *Marker) string {
+	values := map[string]string{"folder": m.Folder, "path": m.Folder, "job": m.Job, "owner": m.Owner, "session": m.Session, "kind": m.effectiveKind()}
+	cmd, ok := a.filledCommand(holder["command"], values)
+	if !ok {
+		return "holder failed to run (invalid command)"
+	}
+	name := textValue(holder["name"])
+	if name == "" {
+		name = filepath.Base(cmd[0])
+	}
+	r := a.Run(cmd, timeoutValue(holder, 60), "", withEnv(values))
+	if r.Timeout {
+		return "holder " + name + " timed out"
+	}
+	if r.Err != nil {
+		return fmt.Sprintf("holder %s failed to run (%s)", name, r.Err)
+	}
+	if r.Code == 1 {
+		return ""
+	}
+	if r.Code == 0 {
+		detail := shortText(firstLine(strings.TrimSpace(r.Stdout)), 100)
+		if detail != "" {
+			return "holder " + name + ": " + detail
+		}
+		return "holder " + name
+	}
+	return fmt.Sprintf("holder %s exited %d (treated as held)", name, r.Code)
+}
+func (a *App) holderHold(m *Marker, cfg *Config) string {
+	for _, holder := range cfg.Holders {
+		reason := ""
+		if _, ok := holder["command"]; ok {
+			reason = a.commandHold(holder, m)
+		} else {
+			reason = a.leaseHold(holder, m)
+		}
+		if reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+var epochPattern = regexp.MustCompile(`^\d+(\.\d+)?$`)
+
+func parseClosedAt(s string) *float64 {
+	s = strings.TrimSpace(s)
+	if epochPattern.MatchString(s) {
+		n, e := strconv.ParseFloat(s, 64)
+		if e == nil {
+			return &n
+		}
+		return nil
+	}
+	t, e := time.Parse("2006-01-02T15:04:05Z", s)
+	if e != nil {
+		return nil
+	}
+	n := float64(t.Unix())
+	return &n
+}
+func (a *App) jobClosed(job string, cfg *Config, reg map[string]any) (*bool, *float64, string) {
+	if len(cfg.JobDone) == 0 {
+		return nil, nil, "no job_done command configured"
+	}
+	cache := mapEntry(reg, "jobs")
+	hit := dict(cache[job])
+	if truth(hit["closed"]) && a.Now()-number(hit["checked"]) < 3600 {
+		closed := true
+		var at *float64
+		if hit["closed_at"] != nil {
+			n := number(hit["closed_at"])
+			at = &n
+		}
+		return &closed, at, "closed"
+	}
+	firstSeen := number(hit["first_closed_seen"])
+	cmd, ok := a.filledCommand(cfg.JobDone["command"], map[string]string{"job": job})
+	if !ok {
+		return nil, nil, "job_done failed to run (invalid command)"
+	}
+	r := a.Run(cmd, timeoutValue(cfg.JobDone, 30), "", withEnv(map[string]string{"job": job}))
+	if r.Timeout {
+		return nil, nil, "job_done timed out"
+	}
+	if r.Err != nil {
+		return nil, nil, fmt.Sprintf("job_done failed to run (%s)", r.Err)
+	}
+	if r.Code != 0 && r.Code != 1 {
+		return nil, nil, fmt.Sprintf("job_done exited %d", r.Code)
+	}
+	closed := r.Code == 0
+	var at *float64
+	if closed && strings.TrimSpace(r.Stdout) != "" {
+		at = parseClosedAt(firstLine(r.Stdout))
+	}
+	record := map[string]any{"closed": closed, "closed_at": nil, "checked": a.Now()}
+	if closed && at == nil {
+		if firstSeen == 0 {
+			firstSeen = a.Now()
+		}
+		record["first_closed_seen"] = firstSeen
+		at = &firstSeen
+	}
+	if at != nil {
+		record["closed_at"] = *at
+	}
+	cache[job] = record
+	if closed {
+		return &closed, at, "closed"
+	}
+	return &closed, at, "open"
+}
+
+var digitsPattern = regexp.MustCompile(`^\d+$`)
+
+func (a *App) sessionRunning(session string) string {
+	if digitsPattern.MatchString(session) {
+		pid, err := strconv.Atoi(session)
+		if err != nil {
+			return "unknown"
+		}
+		if pidAlive(pid) {
+			return "alive"
+		}
+		return "gone"
+	}
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		return "unknown"
+	}
+	r := a.Run([]string{"pgrep", "-f", "--", session}, 15, "", nil)
+	if r.Err != nil || r.Timeout || r.Code != 0 && r.Code != 1 {
+		return "unknown"
+	}
+	for _, s := range strings.Fields(r.Stdout) {
+		pid, e := strconv.Atoi(s)
+		if e == nil && pid != os.Getpid() {
+			return "alive"
+		}
+	}
+	return "no-match"
+}
+func changes(output string, porcelain bool) []string {
+	var out []string
+	for _, line := range strings.Split(output, "\n") {
+		path := ""
+		if porcelain {
+			if len(line) >= 3 {
+				path = line[3:]
+			}
+		} else {
+			path = strings.TrimSpace(line)
+		}
+		if path != "" && path != markerName {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+func unavailable(r Result) bool { return r.Err != nil || r.Timeout }
+func (a *App) repoState(folder string) (string, string) {
+	jj, git := filepath.Join(folder, ".jj"), filepath.Join(folder, ".git")
+	if isDir(jj) {
+		kind := "jj-primary"
+		if isFile(filepath.Join(jj, "repo")) {
+			kind = "jj-secondary"
+		}
+		d := a.Run([]string{"jj", "-R", folder, "--ignore-working-copy", "diff", "--name-only"}, 60, "", nil)
+		if unavailable(d) {
+			return kind, "jj unavailable or timed out"
+		}
+		if d.Code != 0 {
+			return kind, "jj diff failed"
+		}
+		s := a.Run([]string{"jj", "-R", folder, "diff", "--name-only"}, 120, "", nil)
+		if unavailable(s) {
+			return kind, "jj unavailable or timed out"
+		}
+		if s.Code != 0 || len(changes(d.Stdout, false)) > 0 || len(changes(s.Stdout, false)) > 0 {
+			return kind, "dirty (jj diff non-empty)"
+		}
+		u := a.Run([]string{"jj", "-R", folder, "--ignore-working-copy", "log", "--no-graph", "-T", `commit_id ++ "\n"`, "-r", "(::@ ~ ::remote_bookmarks()) ~ empty() ~ root()"}, 60, "", nil)
+		if unavailable(u) {
+			return kind, "jj unavailable or timed out"
+		}
+		if u.Code != 0 {
+			return kind, "jj log failed"
+		}
+		if strings.TrimSpace(u.Stdout) != "" {
+			return kind, "unpushed jj commits"
+		}
+		return kind, ""
+	}
+	if exists(git) {
+		kind := "git-primary"
+		if isFile(git) {
+			kind = "git-linked"
+		}
+		st := a.Run([]string{"git", "-C", folder, "status", "--porcelain"}, 120, "", nil)
+		if unavailable(st) {
+			return kind, "git unavailable or timed out"
+		}
+		if st.Code != 0 {
+			return kind, "git status failed"
+		}
+		if len(changes(st.Stdout, true)) > 0 {
+			return kind, "dirty (git status non-empty)"
+		}
+		un := a.Run([]string{"git", "-C", folder, "rev-list", "--count", "HEAD", "--not", "--remotes"}, 60, "", nil)
+		if unavailable(un) {
+			return kind, "git unavailable or timed out"
+		}
+		if un.Code != 0 {
+			return kind, "git rev-list failed"
+		}
+		if strings.TrimSpace(un.Stdout) != "0" {
+			return kind, strings.TrimSpace(un.Stdout) + " unpushed commits"
+		}
+		return kind, ""
+	}
+	return "", ""
+}
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) Walk {
+	w := Walk{}
+	size := int64(0)
+	root, err := a.Lstat(folder)
+	if err != nil {
+		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
+		return w
+	}
+	dev := device(root)
+	deadline := time.Now().Add(time.Duration(limit * float64(time.Second)))
+	stack := []string{folder}
+	repos := map[string]bool{}
+	patterns := make([]string, len(cfg.DenyPaths))
+	for i, p := range cfg.DenyPaths {
+		patterns[i] = a.expand(p)
+	}
+	for len(stack) > 0 {
+		if time.Now().After(deadline) {
+			w.Problem = "size walk timed out"
+			w.Repos = sortedKeys(repos)
+			return w
+		}
+		d := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			w.Problem = fmt.Sprintf("unreadable %s: %s", d, err)
+			w.Repos = sortedKeys(repos)
+			return w
+		}
+		for _, e := range entries {
+			p := filepath.Join(d, e.Name())
+			st, err := a.Lstat(p)
+			if err != nil {
+				continue
+			}
+			size += allocated(st)
+			w.Files++
+			rel, _ := filepath.Rel(folder, p)
+			for _, pattern := range patterns {
+				if globMatch(p, pattern) {
+					w.Problem = "contains deny-listed " + rel
+					w.Repos = sortedKeys(repos)
+					return w
+				}
+			}
+			if checkNames && denyNameHit(strings.Split(rel, string(filepath.Separator)), cfg) != "" {
+				w.Problem = "contains deny-listed " + rel
+				w.Repos = sortedKeys(repos)
+				return w
+			}
+			if (e.Name() == ".git" || e.Name() == ".jj") && d != folder {
+				repos[d] = true
+			}
+			if st.IsDir() {
+				if device(st) == dev {
+					stack = append(stack, p)
+				} else {
+					w.Crossed = append(w.Crossed, p)
+				}
+			}
+		}
+	}
+	w.Size = &size
+	w.Repos = sortedKeys(repos)
+	return w
+}
+func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string, string) {
+	if w.Problem != "" {
+		return w.Problem, ""
+	}
+	if len(w.Crossed) > 0 {
+		rel, _ := filepath.Rel(folder, w.Crossed[0])
+		return "contains another filesystem at " + rel, ""
+	}
+	repo, problem := a.RepoState(folder)
+	if problem != "" {
+		return "worktree " + problem, repo
+	}
+	if repo == "git-primary" || repo == "jj-primary" {
+		return repo + " repository (only linked worktrees / secondary workspaces are removable)", repo
+	}
+	if m.effectiveKind() == "worktree" && repo == "" {
+		return "kind worktree but no .git/.jj found", repo
+	}
+	for i, nested := range w.Repos {
+		if i >= 20 {
+			break
+		}
+		kind, problem := a.RepoState(nested)
+		rel, _ := filepath.Rel(folder, nested)
+		if problem != "" {
+			return "nested repo " + rel + " " + problem, repo
+		}
+		if kind == "git-primary" || kind == "jj-primary" {
+			return "nested " + kind + " repository " + rel + " (only linked worktrees / secondary workspaces are removable)", repo
+		}
+	}
+	if len(w.Repos) > 20 {
+		return fmt.Sprintf("%d nested repos (too many to verify)", len(w.Repos)), repo
+	}
+	return "", repo
+}
+func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool) *Verdict {
+	v := &Verdict{Folder: folder, Action: "keep"}
+	m, err := a.readMarker(folder)
+	if err != nil {
+		v.Reason = "bad marker: " + err.Error()
+		return v
+	}
+	v.Marker = m
+	v.LastUsed = m.Mtime
+	entry := markerEntry(reg, folder, a.Now())
+	if n, ok := entry["size"]; ok {
+		n := int64(number(n))
+		v.Size = &n
+	}
+	if reason := a.denyReason(folder, cfg); reason != "" {
+		v.Reason = "refused: " + reason
+		return v
+	}
+	v.TTLS, err = parseTTL(a.markerTTL(m))
+	if err != nil {
+		v.Reason = "bad marker: " + err.Error()
+		return v
+	}
+	start := m.Mtime
+	if len(m.Holds) > 0 {
+		names := make([]string, len(m.Holds))
+		for i, h := range m.Holds {
+			names[i] = textValue(h["job"])
+			if h["job"] == nil {
+				names[i] = "None"
+			}
+		}
+		v.Reason = "held by " + strings.Join(names, ", ")
+		return v
+	}
+	var closedAt *float64
+	if m.Job != "" {
+		closed, at, detail := a.jobClosed(m.Job, cfg, reg)
+		closedAt = at
+		if closed == nil || !*closed {
+			if closed == nil {
+				detail = "state unknown: " + detail
+			}
+			v.Reason = "job " + m.Job + " " + detail
+			return v
+		}
+		if at != nil {
+			start = max(start, *at)
+		}
+	}
+	if m.Session != "" {
+		running := a.SessionRunning(m.Session)
+		id := shortText(m.Session, 12)
+		if running == "no-match" && cfg.SessionGrace != nil && m.Job != "" && !digitsPattern.MatchString(m.Session) {
+			if closedAt == nil || *closedAt == 0 {
+				v.Reason = "session " + id + " unknown and job close time unavailable"
+				delete(entry, "session_exit_seen")
+				return v
+			}
+			ready := *closedAt + *cfg.SessionGrace
+			if a.Now() < ready {
+				v.Reason = "session " + id + " within grace (job closed " + humanAge(a.Now()-*closedAt) + " ago, grace " + humanAge(*cfg.SessionGrace) + ")"
+				delete(entry, "session_exit_seen")
+				return v
+			}
+			running = "gone"
+			if _, ok := entry["session_exit_seen"]; !ok {
+				entry["session_exit_seen"] = ready
+			}
+		}
+		if running == "unknown" || running == "no-match" || running == "" {
+			v.Reason = "session " + id + " state unknown"
+			delete(entry, "session_exit_seen")
+			return v
+		}
+		if running == "alive" {
+			v.Reason = "session " + id + " still running"
+			delete(entry, "session_exit_seen")
+			return v
+		}
+		if _, ok := entry["session_exit_seen"]; !ok {
+			entry["session_exit_seen"] = a.Now()
+		}
+		start = max(start, number(entry["session_exit_seen"]))
+	}
+	v.ClockStart = start
+	v.Expired = a.Now()-start >= v.TTLS
+	if !deep {
+		v.Safe = true
+		if v.Expired {
+			v.Reason = "expired (shallow)"
+		} else {
+			v.Reason = "fresh, expires in " + humanAge(start+v.TTLS-a.Now())
+		}
+		return v
+	}
+	w := a.walk(folder, cfg, true, 300)
+	if w.Size != nil {
+		v.Size = w.Size
+		entry["size"] = *w.Size
+		entry["size_at"] = a.Now()
+	}
+	reason, repo := a.treeProblem(folder, m, cfg, w)
+	v.Repo = repo
+	if reason != "" {
+		v.Reason = reason
+		return v
+	}
+	if hold := a.holderHold(m, cfg); hold != "" {
+		v.Reason = "held: " + hold
+		return v
+	}
+	if busy := a.OpenFiles(folder); busy != "" {
+		v.Reason = busy
+		return v
+	}
+	v.Safe = true
+	if v.Expired {
+		v.Reason = "expired (" + humanAge(a.Now()-start) + " > " + a.markerTTL(m) + ")"
+	} else {
+		v.Reason = "safe, expires in " + humanAge(start+v.TTLS-a.Now())
+	}
+	dest := m.MoveTo
+	if dest == "" && m.effectiveKind() != "cache" {
+		dest = cfg.MoveRoot
+	}
+	if dest != "" {
+		v.Action = "move"
+		v.Dest = dest
+	} else {
+		v.Action = "delete"
+	}
+	return v
+}
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+func (a *App) row(v *Verdict) map[string]any {
+	var owner, kind, job, ttl, age, size any
+	if m := v.Marker; m != nil {
+		owner = m.Owner
+		kind = m.effectiveKind()
+		job = nullableText(m.Job)
+		if m.JobPresent {
+			job = m.Job
+		}
+		ttl = a.markerTTL(m)
+	}
+	if v.LastUsed != 0 {
+		age = a.Now() - v.LastUsed
+	}
+	if v.Size != nil {
+		size = *v.Size
+	}
+	return map[string]any{"path": v.Folder, "owner": owner, "kind": kind, "job": job, "last_used": v.LastUsed, "age_s": age, "ttl": ttl, "expired": v.Expired, "safe": v.Safe, "size": size, "action": v.Action, "dest": nullableText(v.Dest), "reason": v.Reason}
+}
