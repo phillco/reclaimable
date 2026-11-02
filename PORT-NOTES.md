@@ -20,6 +20,9 @@ tests. No binary is committed.
 - Descriptor operations support macOS/Linux on amd64/arm64; other architectures
   fail closed. Linux symlink inspection uses pinned parent descriptors via procfs;
   unavailable inspection keeps the source.
+- Quarantine uses random names and atomic exclusive renames, including rollback.
+  Existing destinations are preserved; unsupported kernel/filesystem operations
+  keep data rather than falling back to an overwriting rename.
 - Local copies preserve full mode bits/macOS flags; the updated Python snapshot
   retains ordinary permission bits. Both refuse unverifiable extended payloads
   (including resource forks), except system provenance.
@@ -46,6 +49,8 @@ Additional regressions cover canonical volume-floor lookup during planning and
 ignored directory symlinks in JJ/Git checkouts. These match the updated reference.
 Safety walks also reject child-directory replacement after descent; JJ metadata
 pruning folds root names while keeping symlink entries subject to tracked checks.
+Quarantine regressions cover existing directories, files, dangling symlinks,
+name collisions, successful renames, and source recreation before rollback.
 
 ## Python to Go test mapping
 

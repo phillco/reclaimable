@@ -14,7 +14,8 @@ import (
 // package exposes direct kernel traps on both supported Darwin architectures.
 const (
 	darwinOpenAt     = 463
-	darwinRenameAt   = 465
+	darwinRenameAtX  = 488
+	darwinRenameExcl = 0x00000004 // RENAME_EXCL from sys/stdio.h.
 	darwinStatAt     = 470
 	darwinUnlinkAt   = 472
 	darwinReadlinkAt = 473
@@ -131,13 +132,15 @@ func renameAt(oldParent *os.File, oldName string, newParent *os.File, newName st
 	if err != nil {
 		return err
 	}
-	_, _, e := syscall.Syscall6(darwinRenameAt, oldParent.Fd(), uintptr(unsafe.Pointer(old)), newParent.Fd(), uintptr(unsafe.Pointer(next)), 0, 0)
+	// Quarantine and rollback must never replace an entry that already exists.
+	// Unsupported exclusive renames fail closed; there is no ordinary-rename fallback.
+	_, _, e := syscall.Syscall6(darwinRenameAtX, oldParent.Fd(), uintptr(unsafe.Pointer(old)), newParent.Fd(), uintptr(unsafe.Pointer(next)), darwinRenameExcl, 0)
 	runtime.KeepAlive(oldParent)
 	runtime.KeepAlive(newParent)
 	runtime.KeepAlive(old)
 	runtime.KeepAlive(next)
 	if e != 0 {
-		return &os.LinkError{Op: "renameat", Old: oldName, New: newName, Err: e}
+		return &os.LinkError{Op: "renameatx_np", Old: oldName, New: newName, Err: e}
 	}
 	return nil
 }

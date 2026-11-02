@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 )
@@ -585,6 +585,11 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 		if problem := recheck(src); problem != "" {
 			return false, "kept source" + destDetail + ": " + problem
 		}
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return false, "quarantine name failed: " + err.Error()
+		}
+		trash = filepath.Join(filepath.Dir(v.Folder), fmt.Sprintf(".%s.reclaimable-trash-%x", sourceName, nonce))
 		if v.Repo == "git-linked" {
 			res := a.Run([]string{"git", "-C", v.Folder, "rev-parse", "--git-common-dir"}, 30, "", nil)
 			if res.Err == nil && !res.Timeout && res.Code == 0 {
@@ -607,8 +612,8 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 				return false, "jj workspace forget failed: " + detail
 			}
 		}
-		trash = filepath.Join(filepath.Dir(v.Folder), "."+filepath.Base(v.Folder)+".reclaimable-trash-"+strconv.FormatInt(int64(a.Now()), 10))
 		a.fsBefore("remove-rename", filepath.Dir(v.Folder), sourceName)
+		a.fsBefore("remove-quarantine", filepath.Dir(v.Folder), filepath.Base(trash))
 		currentParent, openErr := openPathDir(filepath.Dir(v.Folder))
 		if openErr != nil {
 			return false, "folder parent changed before rename"

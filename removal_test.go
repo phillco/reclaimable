@@ -278,6 +278,83 @@ func TestFolderSwappedForDirectoryBeforeRenameIsRestored(t *testing.T) {
 	must(t, err)
 	check(t, !ok && string(b) == "precious" && strings.Contains(detail, "restored"), "%v %s", ok, detail)
 }
+
+func TestExistingQuarantinePreserved(t *testing.T) {
+	e := newTestEnv(t)
+	f := e.make(t, "source", 30*day, nil, nil)
+	v := safetyEval(e, f)
+	check(t, v.Safe, "fixture: %s", debugVerdict(v))
+	e.A.Now = func() float64 { return 2000000000 }
+	trash := filepath.Join(filepath.Dir(f), ".source.reclaimable-trash-2000000000")
+	must(t, os.Mkdir(trash, 0750))
+	before, err := os.Stat(trash)
+	must(t, err)
+	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
+	after, err := os.Stat(trash)
+	must(t, err)
+	check(t, sameIdentity(before, after) && before.Mode() == after.Mode(), "existing quarantine replaced: %v %s", ok, detail)
+}
+
+func TestQuarantineCollisionKeepsSource(t *testing.T) {
+	e := newTestEnv(t)
+	f := e.make(t, "source", 30*day, nil, nil)
+	v := safetyEval(e, f)
+	var collision string
+	var before os.FileInfo
+	e.A.FSBefore = func(op, parent, name string) {
+		if op == "remove-quarantine" {
+			check(t, strings.HasPrefix(name, ".source.reclaimable-trash-") && len(strings.TrimPrefix(name, ".source.reclaimable-trash-")) == 32, "invalid random quarantine name: %s", name)
+			collision = filepath.Join(parent, name)
+			must(t, os.Mkdir(collision, 0750))
+			var err error
+			before, err = os.Stat(collision)
+			must(t, err)
+		}
+	}
+	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
+	after, err := os.Stat(collision)
+	must(t, err)
+	check(t, !ok && exists(f) && sameIdentity(before, after) && strings.Contains(detail, "rename failed"), "collision lost data: %v %s", ok, detail)
+}
+
+func TestRollbackNeverOverwritesRecreatedSource(t *testing.T) {
+	for _, replacement := range []string{"directory", "symlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			e := newTestEnv(t)
+			f := e.make(t, "source", 30*day, nil, nil)
+			victim := filepath.Join(e.Root, "victim")
+			removalWrite(t, filepath.Join(victim, "valuable"), "irreplaceable")
+			v := safetyEval(e, f)
+			swapped := false
+			e.A.FSBefore = func(op, parent, name string) {
+				if op == "remove-rename" && !swapped {
+					swapped = true
+					must(t, os.Rename(f, filepath.Join(e.Root, "saved-source")))
+					if replacement == "symlink" {
+						must(t, os.Symlink(victim, f))
+					} else {
+						must(t, os.Rename(victim, f))
+					}
+				}
+			}
+			var recreated os.FileInfo
+			realStat := e.A.StatAt
+			e.A.StatAt = func(parent *os.File, name string, follow bool) (os.FileInfo, error) {
+				st, err := realStat(parent, name, follow)
+				if swapped && recreated == nil && strings.HasPrefix(name, ".source.reclaimable-trash-") {
+					must(t, os.Mkdir(f, 0750))
+					recreated, err = os.Lstat(f)
+					must(t, err)
+				}
+				return st, err
+			}
+			ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
+			after, err := os.Lstat(f)
+			must(t, err)
+			check(t, !ok && recreated != nil && sameIdentity(recreated, after) && strings.Contains(detail, "restore failed"), "rollback overwrote recreated source: %v %s", ok, detail)
+		})
+	}
+}
 func TestHashWalkErrorKeepsSource(t *testing.T) {
 	e := newTestEnv(t)
 	f, _ := makeMovable(t, e, "hash-error")
