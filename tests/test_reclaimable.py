@@ -1289,3 +1289,21 @@ def test_plan_matches_volume_floor_by_absolute_mount(env, monkeypatch):
     monkeypatch.chdir(mount)
     env.cfg.volume_floors = {str(rc.expand(".")): 10**18}
     assert [x.folder for x, _ in rc.plan([v], env.cfg)] == [f]
+
+
+# --- review round: marker validity, capacity, ignored files ----------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"regenerate": ""}, {"regenerate": "  "}, {"regenerate": 5}, {"regenerate": None}],
+)
+def test_marker_without_regenerate_is_invalid_and_kept(env, bad):
+    f = make(env, "noregen", age_s=99 * DAY, **bad)
+    v = rc.evaluate(f, env.cfg, env.reg)
+    assert not v.safe and "regenerate" in v.reason
+    g = make(env, "noregen2", age_s=99 * DAY)
+    data = json.loads((g / ".reclaimable").read_text())
+    del data["regenerate"]
+    (g / ".reclaimable").write_text(json.dumps(data))
+    assert "regenerate" in rc.evaluate(g, env.cfg, env.reg).reason

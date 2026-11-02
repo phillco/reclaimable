@@ -431,6 +431,10 @@ def read_marker(folder: Path) -> Marker:
         raise ValueError("marker is not a JSON object")
     if not isinstance(data.get("owner"), str) or not data["owner"].strip():
         raise ValueError("marker needs an owner")
+    if not isinstance(data.get("regenerate"), str) or not data["regenerate"].strip():
+        raise ValueError("marker needs a regenerate description")
+    if "ignored_ok" in data and not isinstance(data["ignored_ok"], bool):
+        raise ValueError("ignored_ok must be true or false")
     kind = data.get("kind")
     if kind is not None and kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}")
@@ -444,7 +448,7 @@ def read_marker(folder: Path) -> Marker:
         folder=folder,
         owner=data["owner"],
         ttl=data.get("ttl"),
-        regenerate=str(data.get("regenerate") or ""),
+        regenerate=data["regenerate"],
         kind=kind,
         job=None if data.get("job") is None else str(data["job"]),
         session=None if data.get("session") is None else str(data["session"]),
