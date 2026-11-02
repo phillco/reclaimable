@@ -75,7 +75,8 @@ func probeMountedDefaultRoot(path string) (defaultRootResult, error) {
 		}
 	}
 	if !writable(path) {
-		return result, fmt.Errorf("volume is not readable and writable")
+		// Read-only volumes (Recovery, mounted images) are expected; skip quietly.
+		return result, nil
 	}
 	// Access alone can succeed without a removable-volume privacy grant. Check
 	// that open answers too, but do not enumerate or read the volume's contents.

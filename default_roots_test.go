@@ -115,3 +115,14 @@ func TestDefaultMountedRootFilters(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultMountedRootReadOnlySkipsQuietly(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	root := t.TempDir()
+	must(t, os.Chmod(root, 0555))
+	t.Cleanup(func() { os.Chmod(root, 0755) })
+	result, err := probeMountedDefaultRoot(root)
+	check(t, err == nil && !result.Include, "read-only volume should be skipped without a warning: %+v %v", result, err)
+}
