@@ -1140,8 +1140,9 @@ def ignored_files(folder: Path, repo: str) -> str | None:
                     return f"contains ignored files; marker lacks ignored_ok ({line[3:]})"
             return None
         res = run(
-            ["jj", "-R", str(folder), "--ignore-working-copy", "file", "list"],
+            ["jj", "--ignore-working-copy", "file", "list"],
             timeout=120,
+            cwd=folder,
         )
         if res.returncode != 0:
             return "jj file list failed"
