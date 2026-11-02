@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 const defaultRootWorker = "--internal-default-root-probe"
@@ -74,9 +75,13 @@ func probeMountedDefaultRoot(path string) (defaultRootResult, error) {
 			return result, err
 		}
 	}
-	if !writable(path) {
-		// Read-only volumes (Recovery, mounted images) are expected; skip quietly.
-		return result, nil
+	if err := syscall.Access(path, 2|4|1); err != nil {
+		// Read-only or permission-denied volumes (Recovery, mounted images) are
+		// expected; skip quietly. Anything else (EIO, ESTALE, ...) still warns.
+		if err == syscall.EACCES || err == syscall.EPERM || err == syscall.EROFS {
+			return result, nil
+		}
+		return result, err
 	}
 	// Access alone can succeed without a removable-volume privacy grant. Check
 	// that open answers too, but do not enumerate or read the volume's contents.
