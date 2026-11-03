@@ -196,25 +196,11 @@ func copySymlinkMetadataAt(srcParent *os.File, srcName string, destParent *os.Fi
 		return err
 	}
 	defer src.Close()
-	current, err := src.Stat()
-	if err != nil {
-		return err
-	}
-	if !sameIdentity(current, info) {
-		return fmt.Errorf("source symlink changed during metadata copy")
-	}
 	dest, err := pinSymlinkAt(destParent, destName)
 	if err != nil {
 		return err
 	}
 	defer dest.Close()
-	openedDest, err := dest.Stat()
-	if err != nil {
-		return err
-	}
-	if !sameIdentity(openedDest, destInfo) {
-		return fmt.Errorf("destination symlink changed during metadata copy")
-	}
 	if err = fdSetTimes(dest, accessTime(info), info.ModTime()); err != nil {
 		return err
 	}
@@ -223,12 +209,6 @@ func copySymlinkMetadataAt(srcParent *os.File, srcName string, destParent *os.Fi
 		return err
 	}
 	for _, name := range names {
-		if err = verifyCopyLeaf(srcParent, srcName, src); err != nil {
-			return err
-		}
-		if err = verifyCopyLeaf(destParent, destName, dest); err != nil {
-			return err
-		}
 		value, err := linkGetXattr(srcParent, srcName, name)
 		if err != nil {
 			return err
@@ -237,8 +217,5 @@ func copySymlinkMetadataAt(srcParent *os.File, srcName string, destParent *os.Fi
 			return err
 		}
 	}
-	if err = verifyCopyLeaf(srcParent, srcName, src); err != nil {
-		return err
-	}
-	return verifyCopyLeaf(destParent, destName, dest)
+	return nil
 }

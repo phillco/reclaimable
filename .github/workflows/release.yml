@@ -39,12 +39,14 @@ jobs:
           mkdir -p dist
           stage=$(mktemp -d)
           trap 'rm -rf "$stage"' EXIT
-          cp LICENSE README.md UNICODE-LICENSE.txt "$stage/"
+          cp LICENSE README.md "$stage/"
           cp vendor/github.com/BurntSushi/toml/COPYING "$stage/LICENSE-toml"
+          cp vendor/golang.org/x/text/LICENSE "$stage/LICENSE-x-text"
+          cp vendor/golang.org/x/text/PATENTS "$stage/PATENTS-x-text"
           for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
             export GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
             go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$stage/reclaimable" .
-            COPYFILE_DISABLE=1 tar -czf "dist/reclaimable_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "$stage" reclaimable LICENSE LICENSE-toml UNICODE-LICENSE.txt README.md
+            COPYFILE_DISABLE=1 tar -czf "dist/reclaimable_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "$stage" reclaimable LICENSE LICENSE-toml LICENSE-x-text PATENTS-x-text README.md
           done
           (cd dist && shasum -a 256 -- *.tar.gz > checksums.txt)
       - name: Attest archives

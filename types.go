@@ -41,8 +41,6 @@ type App struct {
 	Identity                                                                       func(string) (FileIdentity, bool)
 	ListDir                                                                        func(string) ([]os.DirEntry, error)
 	IsMount                                                                        func(string) bool
-	FSBefore                                                                       func(string, string, string)
-	Rename                                                                         func(string, string) error
 	FileHashes                                                                     func(string) (map[string]string, error)
 	HashDir                                                                        func(*os.File, string) (map[string]string, error)
 	MoveAndVerify                                                                  func(string, string, []string, map[string]string) (bool, string)
@@ -68,7 +66,6 @@ type Config struct {
 	SessionGrace                    *float64
 }
 type Marker struct {
-	DirectoryID                                                *FileIdentity
 	Folder, Owner, TTL, Regenerate, Kind, Job, Session, MoveTo string
 	Holds                                                      []map[string]any
 	Mtime                                                      float64
@@ -96,10 +93,8 @@ type Walk struct {
 	Problem        string
 	Repos, Crossed []string
 	Markers        []string
-	MarkerFolders  map[string]FileIdentity
 }
 type Verdict struct {
-	DirectoryID                *FileIdentity
 	Marker                     *Marker
 	Folder                     string
 	LastUsed, ClockStart, TTLS float64
@@ -151,7 +146,6 @@ func newApp() *App {
 	a.ListDir = listDir
 	a.IsMount = isMount
 	a.StatAt = statAt
-	a.Rename = os.Rename
 	a.OpenFiles = a.openFiles
 	a.ProcessCwd = a.processCwd
 	a.SessionRunning = a.sessionRunning

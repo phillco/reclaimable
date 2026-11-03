@@ -625,76 +625,31 @@ func (a *App) ignoredFiles(folder, repo string) string {
 	for _, line := range strings.Split(r.Stdout, "\n") {
 		tracked[line] = true
 	}
-	root, err := openPathDir(folder)
-	if err != nil {
-		return "ignored-file check unavailable"
-	}
-	defer root.Close()
-	rootInfo, err := root.Stat()
-	if err != nil {
-		return "ignored-file check unavailable"
-	}
 	hidden := ""
-	var descend func(*os.File, string) error
-	descend = func(dir *os.File, relative string) error {
-		entries, err := dir.ReadDir(-1)
+	err := filepath.WalkDir(folder, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		for _, entry := range entries {
-			name := entry.Name()
-			rel := filepath.Join(relative, name)
-			st, err := a.StatAt(dir, name, false)
-			if err != nil {
-				return err
+		rel, err := filepath.Rel(folder, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if entry.IsDir() {
+			if filepath.Dir(rel) == "." && (fold(entry.Name()) == ".jj" || fold(entry.Name()) == ".git") {
+				return filepath.SkipDir
 			}
-			if st.IsDir() {
-				if relative == "" && (fold(name) == ".jj" || fold(name) == ".git") {
-					continue
-				}
-				if device(st) != device(rootInfo) {
-					return fmt.Errorf("another filesystem")
-				}
-				a.fsBefore("ignored-descend", filepath.Join(folder, relative), name)
-				next, err := openAt(dir, name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
-				if err != nil {
-					return err
-				}
-				opened, err := next.Stat()
-				if err != nil {
-					next.Close()
-					return err
-				}
-				if !sameIdentity(st, opened) {
-					next.Close()
-					return fmt.Errorf("directory replaced")
-				}
-				err = descend(next, rel)
-				closeErr := next.Close()
-				if err != nil {
-					return err
-				}
-				if closeErr != nil {
-					return closeErr
-				}
-				current, err := a.StatAt(dir, name, false)
-				if err != nil || !sameIdentity(st, current) {
-					return fmt.Errorf("directory replaced")
-				}
-				if hidden != "" {
-					return nil
-				}
-				continue
-			}
-			if rel != markerName && !tracked[rel] {
-				hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
-				return nil
-			}
+			return nil
+		}
+		if rel != markerName && !tracked[rel] {
+			hidden = "contains ignored files; marker lacks ignored_ok (" + rel + ")"
+			return filepath.SkipAll
 		}
 		return nil
-	}
-	if err := descend(root, ""); err != nil {
+	})
+	if err != nil {
 		return "ignored-file check unavailable"
 	}
 	return hidden
@@ -710,30 +665,12 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (w Walk) {
 	folder = a.expand(folder)
-	inspected, err := a.Lstat(folder)
-	if err != nil {
-		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
-		return w
-	}
-	if !inspected.IsDir() {
-		w.Problem = "unreadable " + folder + ": not a real directory"
-		return w
-	}
 	root, err := openPathDir(folder)
 	if err != nil {
 		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
 		return w
 	}
 	defer root.Close()
-	opened, err := root.Stat()
-	if err != nil {
-		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
-		return w
-	}
-	if device(opened) != device(inspected) || inode(opened) != inode(inspected) {
-		w.Problem = "folder replaced during size walk"
-		return w
-	}
 	return a.walkAt(root, folder, cfg, checkNames, limit)
 }
 
@@ -742,7 +679,6 @@ func (a *App) walk(folder string, cfg *Config, checkNames bool, limit float64) (
 func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool, limit float64) (w Walk) {
 	folder = a.expand(folder)
 	repos := map[string]bool{}
-	w.MarkerFolders = map[string]FileIdentity{}
 	defer func() { w.Repos = sortedKeys(repos) }()
 	scanRoot, err := openAt(root, ".", syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
 	if err != nil {
@@ -753,10 +689,6 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 	opened, err := scanRoot.Stat()
 	if err != nil {
 		w.Problem = fmt.Sprintf("unreadable %s: %s", folder, err)
-		return w
-	}
-	if !opened.IsDir() {
-		w.Problem = "unreadable " + folder + ": not a real directory"
 		return w
 	}
 	dev := device(opened)
@@ -774,7 +706,6 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 	size := int64(0)
 	type childDir struct {
 		name, path string
-		info       os.FileInfo
 	}
 	var descend func(*os.File, string) bool
 	descend = func(dir *os.File, logical string) bool {
@@ -815,27 +746,16 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 				w.Problem = "unreadable " + p + ": " + err.Error()
 				return false
 			}
-			absolute, err := filepath.Abs(p)
-			if err != nil {
-				w.Problem = "unreadable " + p + ": " + err.Error()
-				return false
-			}
 			if fold(e.Name()) == fold(markerName) && a.pathKey(logical) != a.pathKey(folder) {
 				if !st.Mode().IsRegular() {
 					w.Problem = "invalid nested marker " + rel
 					return false
 				}
-				parentInfo, err := dir.Stat()
-				if err != nil {
-					w.Problem = fmt.Sprintf("unreadable %s: %s", logical, err)
-					return false
-				}
 				w.Markers = append(w.Markers, p)
-				w.MarkerFolders[p] = FileIdentity{device(parentInfo), inode(parentInfo)}
 			}
 			hitPath := false
 			for _, pattern := range patterns {
-				if a.pathMatch(p, pattern) || a.pathMatch(absolute, pattern) {
+				if a.pathMatch(p, pattern) {
 					hitPath = true
 					break
 				}
@@ -853,7 +773,7 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 			}
 			if st.IsDir() {
 				if device(st) == dev {
-					children = append(children, childDir{e.Name(), p, st})
+					children = append(children, childDir{e.Name(), p})
 				} else {
 					w.Crossed = append(w.Crossed, p)
 				}
@@ -861,23 +781,9 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 		}
 		for i := len(children) - 1; i >= 0; i-- {
 			child := children[i]
-			if a.FSBefore != nil {
-				a.FSBefore("walk-descend", logical, child.name)
-			}
 			next, err := openAt(dir, child.name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_RDONLY, 0)
 			if err != nil {
 				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, err)
-				return false
-			}
-			actual, err := next.Stat()
-			if err != nil {
-				next.Close()
-				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, err)
-				return false
-			}
-			if !actual.IsDir() || device(actual) != dev || device(actual) != device(child.info) || inode(actual) != inode(child.info) {
-				next.Close()
-				w.Problem = "directory replaced during size walk: " + child.path
 				return false
 			}
 			ok := descend(next, child.path)
@@ -889,11 +795,7 @@ func (a *App) walkAt(root *os.File, folder string, cfg *Config, checkNames bool,
 				w.Problem = fmt.Sprintf("unreadable %s: %s", child.path, closeErr)
 				return false
 			}
-			current, err := a.StatAt(dir, child.name, false)
-			if err != nil || !sameIdentity(child.info, current) {
-				w.Problem = "directory replaced during size walk: " + child.path
-				return false
-			}
+
 		}
 		return true
 	}
@@ -961,12 +863,6 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 		parent, err := openPathDir(nestedFolder)
 		if err != nil {
 			return label + ": unreadable or invalid (" + err.Error() + ")", ""
-		}
-		parentInfo, err := parent.Stat()
-		expected, known := w.MarkerFolders[markerPath]
-		if err != nil || !known || expected != (FileIdentity{device(parentInfo), inode(parentInfo)}) {
-			parent.Close()
-			return label + ": unreadable or invalid (marker directory changed since walk)", ""
 		}
 		nested, err := a.readMarkerAt(parent, nestedFolder, filepath.Base(markerPath))
 		closeErr := parent.Close()
@@ -1051,6 +947,10 @@ func (a *App) treeProblem(folder string, m *Marker, cfg *Config, w Walk) (string
 	return "", repo
 }
 func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool) *Verdict {
+	return a.evaluateChecked(folder, cfg, reg, deep, false)
+}
+
+func (a *App) evaluateChecked(folder string, cfg *Config, reg map[string]any, deep, freshJob bool) *Verdict {
 	folder = a.expand(folder)
 	v := &Verdict{Folder: folder, Action: "keep"}
 	m, err := a.readMarker(folder)
@@ -1059,7 +959,6 @@ func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool
 		return v
 	}
 	v.Marker = m
-	v.DirectoryID = m.DirectoryID
 	v.LastUsed = m.Mtime
 	entry := markerEntry(reg, folder, a.Now())
 	if n, ok := entry["size"]; ok {
@@ -1089,7 +988,7 @@ func (a *App) evaluate(folder string, cfg *Config, reg map[string]any, deep bool
 	}
 	var closedAt *float64
 	if m.Job != "" {
-		closed, at, detail := a.jobClosed(m.Job, cfg, reg)
+		closed, at, detail := a.jobClosedChecked(m.Job, cfg, reg, !freshJob)
 		closedAt = at
 		if closed == nil || !*closed {
 			if closed == nil {

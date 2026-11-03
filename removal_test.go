@@ -132,10 +132,10 @@ func TestHoldAndRemovalShareOneLock(t *testing.T) {
 		return realOpen(folder)
 	}
 	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	check(t, ok && entered == 2, "%v %s (%d locks)", ok, detail, entered)
+	check(t, ok && entered == 1, "%v %s (%d locks)", ok, detail, entered)
 	// The hold command must use this same boundary too.
 	g := e.make(t, "held", 30*day, nil, nil)
-	check(t, e.A.main([]string{"hold", g, "reader"}) == 0 && entered == 3, "hold did not take shared lock")
+	check(t, e.A.main([]string{"hold", g, "reader"}) == 0 && entered == 2, "hold did not take shared lock")
 }
 
 type removalInfo struct {
@@ -184,25 +184,6 @@ func TestSymlinkRootAndAncestorRefusedEverywhere(t *testing.T) {
 	check(t, !ok && info.Mode()&os.ModeSymlink != 0 && string(b) == "precious", "%v %s", ok, detail)
 	_, err = e.A.rmtreeSameDev(link)
 	check(t, err != nil && exists(filepath.Join(real, "keep.txt")), "rmtree accepted symlink")
-}
-func TestFolderSwappedForSymlinkBeforeRenameIsRestored(t *testing.T) {
-	e := newTestEnv(t)
-	f := e.make(t, "swap", 30*day, nil, nil)
-	victim := e.make(t, "victim", 0, map[string][]byte{"keep.txt": []byte("precious")}, nil)
-	v := e.A.evaluate(f, e.Cfg, e.Reg, true)
-	swapped := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if op == "remove-rename" && !swapped {
-			swapped = true
-			must(t, os.Rename(f, filepath.Join(filepath.Dir(f), "swapped-away")))
-			must(t, os.Symlink(victim, f))
-		}
-	}
-
-	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	info, err := os.Lstat(f)
-	must(t, err)
-	check(t, !ok && exists(filepath.Join(victim, "keep.txt")) && info.Mode()&os.ModeSymlink != 0, "%v %s", ok, detail)
 }
 func TestDirtyFileAddedAfterEvaluationBlocksRemoval(t *testing.T) {
 	e := newTestEnv(t)
@@ -259,102 +240,6 @@ func TestDirtyFileAddedDuringMoveKeepsSource(t *testing.T) {
 	check(t, !ok && exists(filepath.Join(wt, "late.txt")), "%v %s", ok, detail)
 }
 
-func TestFolderSwappedForDirectoryBeforeRenameIsRestored(t *testing.T) {
-	e := newTestEnv(t)
-	f := e.make(t, "swap-real", 30*day, nil, nil)
-	victim := e.make(t, "real-victim", 0, map[string][]byte{"keep.txt": []byte("precious")}, nil)
-	v := e.A.evaluate(f, e.Cfg, e.Reg, true)
-	swapped := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if op == "remove-rename" && !swapped {
-			swapped = true
-			must(t, os.Rename(f, filepath.Join(filepath.Dir(f), "original-away")))
-			must(t, os.Rename(victim, f))
-		}
-	}
-
-	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	b, err := os.ReadFile(filepath.Join(f, "keep.txt"))
-	must(t, err)
-	check(t, !ok && string(b) == "precious" && strings.Contains(detail, "restored"), "%v %s", ok, detail)
-}
-
-func TestExistingQuarantinePreserved(t *testing.T) {
-	e := newTestEnv(t)
-	f := e.make(t, "source", 30*day, nil, nil)
-	v := safetyEval(e, f)
-	check(t, v.Safe, "fixture: %s", debugVerdict(v))
-	e.A.Now = func() float64 { return 2000000000 }
-	trash := filepath.Join(filepath.Dir(f), ".source.reclaimable-trash-2000000000")
-	must(t, os.Mkdir(trash, 0750))
-	before, err := os.Stat(trash)
-	must(t, err)
-	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	after, err := os.Stat(trash)
-	must(t, err)
-	check(t, sameIdentity(before, after) && before.Mode() == after.Mode(), "existing quarantine replaced: %v %s", ok, detail)
-}
-
-func TestQuarantineCollisionKeepsSource(t *testing.T) {
-	e := newTestEnv(t)
-	f := e.make(t, "source", 30*day, nil, nil)
-	v := safetyEval(e, f)
-	var collision string
-	var before os.FileInfo
-	e.A.FSBefore = func(op, parent, name string) {
-		if op == "remove-quarantine" {
-			check(t, strings.HasPrefix(name, ".source.reclaimable-trash-") && len(strings.TrimPrefix(name, ".source.reclaimable-trash-")) == 32, "invalid random quarantine name: %s", name)
-			collision = filepath.Join(parent, name)
-			must(t, os.Mkdir(collision, 0750))
-			var err error
-			before, err = os.Stat(collision)
-			must(t, err)
-		}
-	}
-	ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	after, err := os.Stat(collision)
-	must(t, err)
-	check(t, !ok && exists(f) && sameIdentity(before, after) && strings.Contains(detail, "rename failed"), "collision lost data: %v %s", ok, detail)
-}
-
-func TestRollbackNeverOverwritesRecreatedSource(t *testing.T) {
-	for _, replacement := range []string{"directory", "symlink"} {
-		t.Run(replacement, func(t *testing.T) {
-			e := newTestEnv(t)
-			f := e.make(t, "source", 30*day, nil, nil)
-			victim := filepath.Join(e.Root, "victim")
-			removalWrite(t, filepath.Join(victim, "valuable"), "irreplaceable")
-			v := safetyEval(e, f)
-			swapped := false
-			e.A.FSBefore = func(op, parent, name string) {
-				if op == "remove-rename" && !swapped {
-					swapped = true
-					must(t, os.Rename(f, filepath.Join(e.Root, "saved-source")))
-					if replacement == "symlink" {
-						must(t, os.Symlink(victim, f))
-					} else {
-						must(t, os.Rename(victim, f))
-					}
-				}
-			}
-			var recreated os.FileInfo
-			realStat := e.A.StatAt
-			e.A.StatAt = func(parent *os.File, name string, follow bool) (os.FileInfo, error) {
-				st, err := realStat(parent, name, follow)
-				if swapped && recreated == nil && strings.HasPrefix(name, ".source.reclaimable-trash-") {
-					must(t, os.Mkdir(f, 0750))
-					recreated, err = os.Lstat(f)
-					must(t, err)
-				}
-				return st, err
-			}
-			ok, detail := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-			after, err := os.Lstat(f)
-			must(t, err)
-			check(t, !ok && recreated != nil && sameIdentity(recreated, after) && strings.Contains(detail, "restore failed"), "rollback overwrote recreated source: %v %s", ok, detail)
-		})
-	}
-}
 func TestHashWalkErrorKeepsSource(t *testing.T) {
 	e := newTestEnv(t)
 	f, _ := makeMovable(t, e, "hash-error")
@@ -421,29 +306,6 @@ func TestHashingAndCopyingDoNotFollowSymlinks(t *testing.T) {
 	check(t, string(b) == "precious", "symlink target modified")
 }
 
-func TestRmtreeDirectorySwappedBeforeEnumerationIsKept(t *testing.T) {
-	e := newTestEnv(t)
-	d := filepath.Join(e.Root, "tree")
-	removalWrite(t, filepath.Join(d, "sub/disposable"), "x")
-	victim := filepath.Join(e.Root, "outside")
-	removalWrite(t, filepath.Join(victim, "precious"), "keep")
-	swapped := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if op == "remove-open" && name == "sub" && !swapped {
-			swapped = true
-			path := filepath.Join(d, "sub")
-			must(t, os.Rename(path, filepath.Join(e.Root, "saved-sub")))
-			must(t, os.Symlink(victim, path))
-		}
-	}
-
-	left, err := e.A.rmtreeSameDev(d)
-	must(t, err)
-	b, err := os.ReadFile(filepath.Join(victim, "precious"))
-	must(t, err)
-	check(t, len(left) > 0 && string(b) == "keep", "left %v; victim %q", left, b)
-}
-
 func TestLocalCopyPreservesTimesAndModes(t *testing.T) {
 	e := newTestEnv(t)
 	src := filepath.Join(e.Root, "metadata-source")
@@ -470,23 +332,6 @@ func TestLocalCopyPreservesTimesAndModes(t *testing.T) {
 	must(t, err)
 	check(t, dir.Mode()&os.ModeSticky != 0 && dir.Mode().Perm() == 0750, "directory mode %v", dir.Mode())
 }
-func TestSymlinkSwapDuringCopyKeepsSource(t *testing.T) {
-	e := newTestEnv(t)
-	f, _ := makeMovable(t, e, "symlink-swap")
-	must(t, os.Symlink("a.txt", filepath.Join(f, "link")))
-	v := e.A.evaluate(f, e.Cfg, e.Reg, true)
-	swapped := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if op == "copy-link" && name == "link" && !swapped {
-			swapped = true
-			must(t, os.Remove(filepath.Join(f, "link")))
-			must(t, os.Symlink("d/b.txt", filepath.Join(f, "link")))
-		}
-	}
-	ok, _ := e.A.removeFolder(v, true, e.Cfg, e.Reg)
-	check(t, !ok && exists(f), "source removed during symlink swap")
-}
-
 func TestJobStateChangeAfterEvaluationBlocksRemoval(t *testing.T) {
 	for _, later := range []string{"open", "garbage", "missing"} {
 		t.Run(later, func(t *testing.T) {

@@ -24,11 +24,8 @@ func refuseExtendedDataFD(file *os.File) error {
 	return refuseRemoteAttributeList(query)
 }
 func refuseSymlinkExtendedDataAt(parent *os.File, name string, pinned *os.File) error {
-	if err := verifyCopyLeaf(parent, name, pinned); err != nil {
-		return err
-	}
 	if err := refuseExtendedDataFD(pinned); err != nil {
 		return err
 	}
-	return verifyCopyLeaf(parent, name, pinned)
+	return nil
 }

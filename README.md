@@ -8,8 +8,8 @@ launchd/cron/systemd) removes or moves expired folders and frees space
 least-recently-used first when a disk runs low. It only touches folders that pass
 every safety check, and folder cleanup does nothing until you arm the host.
 
-Single Go executable for macOS/Linux (amd64/arm64), Go 1.22+. The only library
-dependency is pinned and vendored: `github.com/BurntSushi/toml` v1.4.0.
+Single Go executable for macOS/Linux (amd64/arm64), Go 1.22+. Library dependencies are pinned and vendored:
+`github.com/BurntSushi/toml` v1.4.0 and `golang.org/x/text` v0.22.0.
 
 ```sh
 go build                       # produces ./reclaimable
@@ -96,20 +96,14 @@ Markers are found by a depth-limited scan of `roots` (daily, or `-S`) and regist
 when created with `mark`. State lives in `~/.local/state/reclaimable/`, the log in
 `~/.local/log/reclaimable.log`, the armed flag in `~/.config/reclaimable/armed`.
 
-Without explicit `roots`, discovery uses home plus writable, accessible mounts
-under `/Volumes`, excluding Time Machine volumes and symlinks. Listing `/Volumes`
-and probing each candidate run in separate child processes, each with a two-second
-timeout. All mount and backup-marker metadata checks are inside that timeout.
-The probe checks access and opens then closes the root without reading its
-contents. A stalled or failed probe skips that volume and writes a warning to
-stderr and the log. Set `roots` explicitly to exclude unwanted volumes, or grant
-the binary access in macOS Privacy & Security. Rebuilding an ad-hoc-signed binary
-can invalidate its privacy grants.
+Without explicit `roots`, discovery scans only the home directory. To scan an
+external volume, add its path to `roots`, for example
+`roots = ["~", "/Volumes/Work"]`. Volume discovery is never automatic.
 
 The marker walk checks a 120-second budget between filesystem operations and
 stops at eight directory levels. That budget cannot interrupt a blocked open,
 stat, or directory read, including a privacy prompt deeper inside a selected
-root. Explicit roots are scanned directly, without the default-volume probe.
+root. Configured roots are scanned directly.
 For unattended sweeps, set `roots` to responsive directories the binary can
 access; avoid unavailable mounts and grant any required privacy permissions.
 
@@ -164,13 +158,11 @@ completed keeps the folder (fail closed):
    Nested primary git/jj repositories inside a marked folder keep it too.
 9. **Filesystem boundary**: folders containing another mounted filesystem are
    kept, and deletion never crosses a device boundary.
-10. **Replacement races**: discovery, safety walks, marker reads, hashing, copying
-    and recursive deletion open directories and files relative to checked
-    descriptors, without following symlinks. Opened device/inode identities must
-    match the inspected entries; replacements, unsupported file types and
-    incomplete checks keep the source. Recursive removal never follows a swapped
-    child symlink outside the marked tree.
-10. **Nested markers**: a marker at any depth protects its ancestor unless its
+10. **Descriptor-relative operations**: tree walks, marker reads, copying and
+    recursive deletion open entries relative to directory descriptors without
+    following symlinks. Unsupported file types and incomplete checks keep the
+    source. Removal never traverses symlinks or crosses a device boundary.
+11. **Nested markers**: a marker at any depth protects its ancestor unless its
     own holds, TTL, deny-list, holders and checkout checks permit removal. Marker
     names are recognised case-folded; malformed, unreadable, symlink or non-file
     markers keep the ancestor. Nested job/session markers and requested moves
@@ -181,7 +173,7 @@ applies to every kind, `mirror` included; a walk that times out or hits an unrea
 
 Immediately before removal, **under the same lock `hold` takes**, the marker is
 re-read (touched or held since evaluation means keep), and the deny-list,
-holders, open files, folder identity, a fresh `job_done` answer (the
+holders, open files, a fresh `job_done` answer (the
 positive cache is bypassed; open, unknown or error keeps the folder),
 the session decision (pid exact; a non-pid session needs a fresh process-list
 no-match and an elapsed `session_grace`) and the worktree checks (dirty,
@@ -190,7 +182,7 @@ protections, are re-checked. The TTL clock is recomputed
 from the fresh marker mtime, job close time and session state, and a folder
 selected for its TTL that is no longer expired (a job reopened and reclosed)
 is kept; folders selected because free space is low are exempt. For a **move** the
-folder is read into a private snapshot through checked descriptors, copied
+folder is read through directory descriptors, copied
 locally or streamed to `host:path`, and every file is sha256-verified
 against the source, then the checks above run again and the source's content is
 re-hashed; a hold, new lease, reader or changed file during the copy keeps the
@@ -200,9 +192,9 @@ protocol cannot preserve and verify (automatically attached system provenance is
 excluded). Remote moves require Python 3 on the destination host; the archive receiver
 and hash verifier use the same descriptor-relative protections. A failed copy may
 leave a partial destination for inspection, while retaining the source.
-Removal renames the folder aside through its checked parent descriptor, verifies
-its identity again, then deletes it through descriptors. These checks prevent
-symlink redirection; they do not freeze a tree against concurrent writers.
+Removal uses descriptor-relative deletion. The safety model assumes trusted
+jobs owned by one user: holds and open-file checks protect active work, while
+hostile concurrent renames and entry replacement are outside its scope.
 
 **Dry-run until armed.** Folder sweeps act only once the host is armed (`reclaimable arm`)
 and 24 h have passed. `sweep -n` never acts; `sweep -A` acts immediately but still
@@ -225,7 +217,7 @@ Everything is optional.
 ```toml
 floor_gb = 30                 # or floor = "30GB" / "50GiB"; default 30 GB
 target_gb = 50                # default floor + 20 GB
-roots = ["~", "/Volumes/Data"]       # where to scan for markers (default: home + writable volumes)
+roots = ["~", "/Volumes/Data"]       # where to scan for markers (default: home only)
 move_root = "backup:/archive"        # non-cache kinds move here instead of being deleted
 volume_floors = { "/Volumes/Data" = "100GB" }
 
@@ -447,14 +439,11 @@ and free-space measurements are normalized.
 
 - Help layout, parser/OS/JSON diagnostics, JSON key order and escaping differ.
   Flags, TOML keys, marker/state schemas and ordinary command exits are compatible.
-- Unicode comparison uses pinned Unicode 16.0.0 data. Another Python database can
-  differ for newly assigned characters. Regenerate with
-  `python3 tools/generate_unicode.py` using a matching database, or verify using
-  `python3 tools/generate_unicode.py --check`. See `UNICODE-LICENSE.txt`.
+- Unicode comparison uses x/text's Unicode 15.0.0 NFKC and case-fold data; newer Unicode characters can compare differently from Python.
 - Malformed lease/claim objects and holder-directory settings keep data instead
   of raising exceptions. Size overflow is rejected; invalid/nonfinite arming times
-  and descendant stat failures keep data. File/directory changes during hashing
-  veto verification. Timeouts also bound process groups/pipes.
+  and descendant stat failures keep data. Moves verify copied contents and re-hash
+  the source before deletion. Timeouts also bound process groups/pipes.
 - Descriptor operations support macOS/Linux on amd64/arm64. Other architectures
   keep data. Linux symlink metadata inspection needs procfs; unavailable inspection
   keeps the source. No native copy utility is required.
@@ -473,4 +462,4 @@ command. Building, installing and running tests do not arm the real host.
 
 ## License
 
-MIT; vendored TOML and generated Unicode data retain their included licenses.
+MIT; vendored dependencies retain their included licenses.

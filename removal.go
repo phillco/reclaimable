@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -23,150 +22,24 @@ func (a *App) fileHashes(root string) (map[string]string, error) {
 	return a.HashDir(dir, root)
 }
 func (a *App) fileHashesAt(rootDir *os.File, root string) (map[string]string, error) {
-	dir, err := openAt(rootDir, ".", os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer dir.Close()
-	info, err := dir.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if err := refuseExtendedDataFD(dir); err != nil {
-		return nil, err
-	}
-	rootDev := device(info)
 	out := map[string]string{}
-	var visit func(*os.File, string, string) error
-	visit = func(parent *os.File, relative, logical string) error {
-		before, statErr := parent.Stat()
-		if statErr != nil {
-			return statErr
-		}
-		a.fsBefore("hash-read-dir", logical, ".")
-		entries, err := parent.ReadDir(-1)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			st, err := a.StatAt(parent, name, false)
+	err := a.walkPayload(rootDir, func(parent, file *os.File, name, relative string, st os.FileInfo) error {
+		switch {
+		case st.Mode()&os.ModeSymlink != 0:
+			link, err := readlinkAt(parent, name)
 			if err != nil {
 				return err
 			}
-			if name == ".DS_Store" && !st.IsDir() {
-				continue
+			out[relative] = "link:" + link
+		case st.Mode().IsRegular():
+			h := sha256.New()
+			if _, err := io.Copy(h, file); err != nil {
+				return err
 			}
-			rel := filepath.Join(relative, name)
-			path := filepath.Join(logical, name)
-			a.fsBefore("hash-entry", logical, name)
-			switch {
-			case st.Mode()&os.ModeSymlink != 0:
-				target, err := readlinkAt(parent, name)
-				if err != nil {
-					return err
-				}
-				fresh, err := a.StatAt(parent, name, false)
-				if err != nil || !sameIdentity(st, fresh) {
-					return fmt.Errorf("entry changed during hashing: %s", path)
-				}
-				pinned, pinErr := pinSymlinkAt(parent, name)
-				if pinErr != nil {
-					return pinErr
-				}
-				pinnedInfo, statErr := pinned.Stat()
-				if statErr != nil || !unchangedFile(st, pinnedInfo) {
-					pinned.Close()
-					return fmt.Errorf("symlink changed during hashing: %s", path)
-				}
-				attrErr := refuseSymlinkExtendedDataAt(parent, name, pinned)
-				finalInfo, finalErr := a.StatAt(parent, name, false)
-				if finalErr != nil || !unchangedFile(st, finalInfo) {
-					pinned.Close()
-					return fmt.Errorf("symlink changed during hashing: %s", path)
-				}
-				pinned.Close()
-				if attrErr != nil {
-					return attrErr
-				}
-				out[rel] = "link:" + target
-			case st.IsDir():
-				if device(st) != rootDev {
-					return fmt.Errorf("hash walk crosses filesystem at %s", path)
-				}
-				a.fsBefore("hash-descend", logical, name)
-				child, err := openAt(parent, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-				if err != nil {
-					return err
-				}
-				opened, err := child.Stat()
-				if err != nil || !sameIdentity(st, opened) {
-					child.Close()
-					return fmt.Errorf("directory changed during hashing: %s", path)
-				}
-				if attrErr := refuseExtendedDataFD(child); attrErr != nil {
-					child.Close()
-					return attrErr
-				}
-				err = visit(child, rel, path)
-				child.Close()
-				if err != nil {
-					return err
-				}
-				current, statErr := a.StatAt(parent, name, false)
-				if statErr != nil || !sameIdentity(st, current) {
-					return fmt.Errorf("directory changed during hashing: %s", path)
-				}
-			case st.Mode().IsRegular():
-				child, err := openAt(parent, name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-				if err != nil {
-					return err
-				}
-				opened, err := child.Stat()
-				if err != nil || !sameIdentity(st, opened) || !opened.Mode().IsRegular() {
-					child.Close()
-					return fmt.Errorf("file changed during hashing: %s", path)
-				}
-				if attrErr := refuseExtendedDataFD(child); attrErr != nil {
-					child.Close()
-					return attrErr
-				}
-				a.fsBefore("hash-read", logical, name)
-				h := sha256.New()
-				_, err = io.Copy(h, child)
-				after, statErr := child.Stat()
-				current, pathErr := a.StatAt(parent, name, false)
-				closeErr := child.Close()
-				if pathErr != nil || !unchangedFile(opened, current) {
-					return fmt.Errorf("file changed during hashing: %s", path)
-				}
-				if err != nil {
-					return err
-				}
-				if statErr != nil {
-					return statErr
-				}
-				if closeErr != nil {
-					return closeErr
-				}
-				if !unchangedFile(after, opened) {
-					return fmt.Errorf("file changed during hashing: %s", path)
-				}
-				out[rel] = fmt.Sprintf("%x", h.Sum(nil))
-			default:
-				return fmt.Errorf("cannot hash special file %s", path)
-			}
-		}
-		after, statErr := parent.Stat()
-		if statErr != nil {
-			return statErr
-		}
-		if !unchangedFile(before, after) {
-			return fmt.Errorf("directory changed during hashing: %s", logical)
+			out[relative] = fmt.Sprintf("%x", h.Sum(nil))
 		}
 		return nil
-	}
-	err = visit(dir, "", root)
+	})
 	return out, err
 }
 
@@ -302,20 +175,7 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 			return false, "copy failed: " + copyErr.Error()
 		}
 		defer target.Close()
-		a.fsBefore("verify-copy-root", filepath.Dir(dest), filepath.Base(dest))
 		got, err = a.HashDir(target, dest)
-		if err == nil {
-			current, openErr := openPathDir(dest)
-			if openErr != nil {
-				return false, "destination changed during verification: " + openErr.Error()
-			}
-			now, statErr := current.Stat()
-			current.Close()
-			want, wantErr := target.Stat()
-			if statErr != nil || wantErr != nil || !sameIdentity(now, want) {
-				return false, "destination changed during verification"
-			}
-		}
 		if err != nil {
 			return false, "destination hash failed: " + err.Error()
 		}
@@ -378,7 +238,7 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 	left := []string{}
 	var clear func(*os.File, string, string, os.FileInfo) bool
 	clear = func(parent *os.File, name, path string, want os.FileInfo) bool {
-		a.fsBefore("remove-open", filepath.Dir(path), name)
+
 		dir, err := openAt(parent, name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			left = append(left, path)
@@ -386,11 +246,11 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 		}
 		defer dir.Close()
 		opened, err := dir.Stat()
-		if err != nil || !sameIdentity(want, opened) || device(opened) != dev {
+		if err != nil || device(opened) != dev {
 			left = append(left, path)
 			return false
 		}
-		a.fsBefore("remove-read-dir", path, ".")
+
 		entries, err := dir.ReadDir(-1)
 		if err != nil {
 			left = append(left, path)
@@ -417,7 +277,7 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 				}
 				continue
 			}
-			a.fsBefore("remove-unlink", path, leaf)
+
 			if err := unlinkAt(dir, leaf, false); err != nil {
 				left = append(left, childPath)
 				ok = false
@@ -426,12 +286,7 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 		if !ok {
 			return false
 		}
-		fresh, err := a.StatAt(parent, name, false)
-		if err != nil || !sameIdentity(want, fresh) {
-			left = append(left, path)
-			return false
-		}
-		a.fsBefore("remove-rmdir", filepath.Dir(path), name)
+
 		if err := unlinkAt(parent, name, true); err != nil {
 			left = append(left, path)
 			return false
@@ -443,7 +298,6 @@ func (a *App) clearDirectoryAt(parent *os.File, name, logical string, want os.Fi
 }
 
 func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]any, floorPressure ...bool) (bool, string) {
-	pressure := len(floorPressure) > 0 && floorPressure[0]
 	if !armed {
 		return false, "dry-run"
 	}
@@ -453,120 +307,39 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 	if isMount(v.Folder) {
 		return false, "folder is a mount point"
 	}
-	ident, err := a.Lstat(v.Folder)
-	if err != nil {
-		return false, "folder unreadable: " + err.Error()
-	}
-	if v.DirectoryID != nil && (*v.DirectoryID != (FileIdentity{device(ident), inode(ident)})) {
-		return false, "folder replaced since evaluation"
-	}
-	sourceParent, err := openPathDir(filepath.Dir(v.Folder))
-	if err != nil {
-		return false, "folder parent unreadable: " + err.Error()
-	}
-	defer sourceParent.Close()
-	sourceName := filepath.Base(v.Folder)
-	anchored, err := a.StatAt(sourceParent, sourceName, false)
-	if err != nil || !sameIdentity(ident, anchored) {
-		return false, "folder replaced before descriptor anchoring"
-	}
-	sourceRoot, err := openAt(sourceParent, sourceName, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return false, "folder unreadable: " + err.Error()
-	}
-	defer sourceRoot.Close()
-	opened, err := sourceRoot.Stat()
-	if err != nil || !sameIdentity(ident, opened) {
-		return false, "folder replaced before descriptor anchoring"
-	}
-	recheck := func(src map[string]string) string {
-		fresh, err := a.readMarkerAt(sourceRoot, v.Folder, markerName)
-		if err != nil {
-			return "marker changed: " + err.Error()
+	pressure := len(floorPressure) > 0 && floorPressure[0]
+	check := func() (*Verdict, string) {
+		fresh := a.evaluateChecked(v.Folder, cfg, reg, true, true)
+		if fresh.Marker == nil {
+			return fresh, "marker changed: " + fresh.Reason
 		}
-		if fresh.Mtime != v.Marker.Mtime || len(fresh.Holds) > 0 {
-			return "marker touched or held since evaluation"
+		if fresh.Marker.Mtime != v.Marker.Mtime || len(fresh.Marker.Holds) > 0 {
+			return fresh, "marker touched or held since evaluation"
 		}
-		if a.denyReason(v.Folder, cfg) != "" {
-			return "refused by deny-list"
+		if !fresh.Safe {
+			return fresh, fresh.Reason
 		}
-		st, err := a.Lstat(v.Folder)
-		if err != nil {
-			return "folder unreadable: " + err.Error()
+		if !pressure && !fresh.Expired {
+			return fresh, "no longer expired (clock restarted " + humanAge(a.Now()-fresh.ClockStart) + " ago, ttl " + humanAge(fresh.TTLS) + ")"
 		}
-		if device(st) != device(ident) || inode(st) != inode(ident) {
-			return "folder replaced since evaluation"
-		}
-		if hold := a.holderHold(fresh, cfg); hold != "" {
-			return "held: " + hold
-		}
-		if busy := a.OpenFiles(v.Folder); busy != "" {
-			return busy
-		}
-		var closedAt *float64
-		if fresh.Job != "" {
-			closed, at, detail := a.jobClosedFresh(fresh.Job, cfg, reg)
-			closedAt = at
-			if closed == nil || !*closed {
-				if closed == nil {
-					detail = "state unknown: " + detail
-				}
-				return "job " + fresh.Job + " " + detail
-			}
-		}
-		if reason := a.sessionProblem(fresh, cfg, markerEntry(reg, v.Folder, a.Now()), closedAt); reason != "" {
-			return reason
-		}
-		if !pressure {
-			start := fresh.Mtime
-			if fresh.Job != "" && closedAt != nil {
-				start = max(start, *closedAt)
-			}
-			if fresh.Session != "" {
-				start = max(start, number(markerEntry(reg, v.Folder, a.Now())["session_exit_seen"]))
-			}
-			ttl, err := parseTTL(a.markerTTL(fresh))
-			if err != nil {
-				return "bad marker: " + err.Error()
-			}
-			if a.Now()-start < ttl {
-				return fmt.Sprintf("no longer expired (clock restarted %s ago, ttl %s)", humanAge(a.Now()-start), humanAge(ttl))
-			}
-		}
-		w := a.walkAt(sourceRoot, v.Folder, cfg, true, 300)
-		reason, repo := a.treeProblem(v.Folder, fresh, cfg, w)
-		if reason != "" {
-			return reason
-		}
-		if repo != v.Repo {
-			return "repository type changed since evaluation"
-		}
-		if src != nil {
-			current, err := a.HashDir(sourceRoot, v.Folder)
-			if err != nil {
-				return "source hash failed: " + err.Error()
-			}
-			if !reflect.DeepEqual(withoutMarker(current), src) {
-				return "source changed while it was being copied"
-			}
-		}
-		return ""
-	}
-	unlock, err := a.HoldLock()
-	if err != nil {
-		return false, "hold lock failed: " + err.Error()
-	}
-	problem := recheck(nil)
-	unlock()
-	if problem != "" {
-		return false, problem
+		return fresh, ""
 	}
 	destDetail := ""
 	var src map[string]string
 	if v.Action == "move" {
-		src, err = a.FileHashes(v.Folder)
+		unlock, err := a.HoldLock()
 		if err != nil {
-			return false, "kept source: source hash failed: " + err.Error()
+			return false, "hold lock failed: " + err.Error()
+		}
+		_, problem := check()
+		unlock()
+		if problem != "" {
+			return false, problem
+		}
+		var errHash error
+		src, errHash = a.FileHashes(v.Folder)
+		if errHash != nil {
+			return false, "kept source: source hash failed: " + errHash.Error()
 		}
 		src = withoutMarker(src)
 		ok, detail := a.MoveAndVerify(v.Folder, v.Dest, cfg.RemoteCommand, src)
@@ -575,86 +348,56 @@ func (a *App) removeFolder(v *Verdict, armed bool, cfg *Config, reg map[string]a
 		}
 		destDetail = " -> " + detail
 	}
-	unlock, err = a.HoldLock()
+	unlock, err := a.HoldLock()
 	if err != nil {
 		return false, "hold lock failed: " + err.Error()
 	}
-	var common, trash string
-	ok, detail := func() (bool, string) {
-		defer unlock()
-		if problem := recheck(src); problem != "" {
+	defer unlock()
+	fresh, problem := check()
+	if problem != "" {
+		if v.Action == "move" {
 			return false, "kept source" + destDetail + ": " + problem
 		}
-		var nonce [16]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return false, "quarantine name failed: " + err.Error()
-		}
-		trash = filepath.Join(filepath.Dir(v.Folder), fmt.Sprintf(".%s.reclaimable-trash-%x", sourceName, nonce))
-		if v.Repo == "git-linked" {
-			res := a.Run([]string{"git", "-C", v.Folder, "rev-parse", "--git-common-dir"}, 30, "", nil)
-			if res.Err == nil && !res.Timeout && res.Code == 0 {
-				common = strings.TrimSpace(res.Stdout)
-				if !filepath.IsAbs(common) {
-					common = filepath.Join(v.Folder, common)
-				}
-				if real, err := filepath.EvalSymlinks(common); err == nil {
-					common = real
-				}
-			}
-		}
-		if v.Repo == "jj-secondary" {
-			res := a.Run([]string{"jj", "-R", v.Folder, "--ignore-working-copy", "workspace", "forget"}, 60, "", nil)
-			if res.Err != nil || res.Timeout || res.Code != 0 {
-				detail := strings.TrimSpace(res.Stderr)
-				if len(detail) > 100 {
-					detail = detail[:100]
-				}
-				return false, "jj workspace forget failed: " + detail
-			}
-		}
-		a.fsBefore("remove-rename", filepath.Dir(v.Folder), sourceName)
-		a.fsBefore("remove-quarantine", filepath.Dir(v.Folder), filepath.Base(trash))
-		currentParent, openErr := openPathDir(filepath.Dir(v.Folder))
-		if openErr != nil {
-			return false, "folder parent changed before rename"
-		}
-		currentParentInfo, statErr := currentParent.Stat()
-		currentParent.Close()
-		pinnedParentInfo, pinErr := sourceParent.Stat()
-		if statErr != nil || pinErr != nil || !sameIdentity(currentParentInfo, pinnedParentInfo) {
-			return false, "folder parent changed before rename"
-		}
-		if err := renameAt(sourceParent, sourceName, sourceParent, filepath.Base(trash)); err != nil {
-			return false, "rename failed: " + err.Error()
-		}
-		st, err := a.StatAt(sourceParent, filepath.Base(trash), false)
-		if err != nil || !st.IsDir() {
-			if err := renameAt(sourceParent, filepath.Base(trash), sourceParent, sourceName); err != nil {
-				return false, "folder became a symlink; restore failed: " + err.Error()
-			}
-			return false, "folder became a symlink; restored, nothing deleted"
-		}
-		if device(st) != device(ident) || inode(st) != inode(ident) {
-			if err := renameAt(sourceParent, filepath.Base(trash), sourceParent, sourceName); err != nil {
-				return false, "folder replaced before rename; restore failed: " + err.Error()
-			}
-			return false, "folder replaced before rename; restored, nothing deleted"
-		}
-		return true, ""
-	}()
-	if !ok {
-		return false, detail
+		return false, problem
 	}
-	left, err := a.clearDirectoryAt(sourceParent, filepath.Base(trash), trash, ident)
+	if src != nil {
+		current, err := a.FileHashes(v.Folder)
+		if err != nil {
+			return false, "source hash failed: " + err.Error()
+		}
+		if !reflect.DeepEqual(withoutMarker(current), src) {
+			return false, "source changed while it was being copied"
+		}
+	}
+	common := ""
+	if fresh.Repo == "git-linked" {
+		res := a.Run([]string{"git", "-C", v.Folder, "rev-parse", "--git-common-dir"}, 30, "", nil)
+		if !unavailable(res) && res.Code == 0 {
+			common = strings.TrimSpace(res.Stdout)
+			if !filepath.IsAbs(common) {
+				common = filepath.Join(v.Folder, common)
+			}
+			if real, err := filepath.EvalSymlinks(common); err == nil {
+				common = real
+			}
+		}
+	}
+	if fresh.Repo == "jj-secondary" {
+		res := a.Run([]string{"jj", "-R", v.Folder, "--ignore-working-copy", "workspace", "forget"}, 60, "", nil)
+		if unavailable(res) || res.Code != 0 {
+			return false, "jj workspace forget failed: " + shortText(strings.TrimSpace(res.Stderr), 100)
+		}
+	}
+	left, err := a.rmtreeSameDev(v.Folder)
 	if err != nil {
 		return false, "removal failed: " + err.Error()
+	}
+	if len(left) > 0 {
+		return false, fmt.Sprintf("removal incomplete: %d entries kept", len(left))
 	}
 	if common != "" {
 		a.Run([]string{"git", "--git-dir", common, "worktree", "prune"}, 60, "", nil)
 	}
 	delete(mapEntry(reg, "markers"), v.Folder)
-	if len(left) > 0 {
-		destDetail += fmt.Sprintf(" (left %s holding %d other-filesystem dirs)", trash, len(left))
-	}
 	return true, destDetail
 }

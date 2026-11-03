@@ -338,10 +338,8 @@ func contains(items []string, s string) bool {
 	return false
 }
 func (a *App) defaultRoots() []string {
-	return a.defaultRootsWith("/Volumes", 2, defaultRootCommand)
+	return []string{a.Home}
 }
-
-func writable(p string) bool { return syscall.Access(p, 2|4|1) == nil }
 
 func (a *App) parseMarker(content []byte, folder string, st os.FileInfo) (*Marker, error) {
 	var e error
@@ -673,11 +671,6 @@ func (a *App) denyReason(path string, cfg *Config) string {
 			return fmt.Sprintf("symlink in path (%s); mark the real directory", p)
 		}
 	}
-	real, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		real = path
-	}
-	real = a.expand(real)
 	targets, err := a.denyTargets(cfg)
 	if err != nil {
 		return fmt.Sprintf("deny-list unreadable (%s)", err)
@@ -688,83 +681,77 @@ func (a *App) denyReason(path string, cfg *Config) string {
 			protected[id] = true
 		}
 	}
-	candidates := []string{path}
-	if real != path {
-		candidates = append(candidates, real)
+	chain := ancestors(path)
+	type identified struct {
+		id FileIdentity
+		ok bool
 	}
-	for _, candidate := range candidates {
-		chain := ancestors(candidate)
-		type identified struct {
-			id FileIdentity
-			ok bool
+	ids := make([]identified, len(chain))
+	for i, p := range chain {
+		ids[i].id, ids[i].ok = a.Identity(p)
+	}
+	cand := ids[0]
+	for _, raw := range cfg.DenyExact {
+		target := a.expand(raw)
+		same := a.pathKey(path) == a.pathKey(target)
+		if cand.ok {
+			tid, ok := a.Identity(target)
+			same = same || ok && cand.id == tid
 		}
-		ids := make([]identified, len(chain))
-		for i, p := range chain {
-			ids[i].id, ids[i].ok = a.Identity(p)
+		if same {
+			return "broad folder " + raw
 		}
-		cand := ids[0]
-		for _, raw := range cfg.DenyExact {
-			target := a.expand(raw)
-			same := a.pathKey(candidate) == a.pathKey(target)
-			if cand.ok {
-				tid, ok := a.Identity(target)
-				same = same || ok && cand.id == tid
+	}
+	if p := a.pathKey(filepath.Dir(path)); p == "/users" || p == "/volumes" {
+		return "home or volume root"
+	}
+	for _, id := range ids {
+		if id.ok && protected[id.id] {
+			return "deny-list (same directory as a protected path)"
+		}
+	}
+	for _, raw := range cfg.DenyPaths {
+		pattern := a.expand(raw)
+		for _, anc := range chain {
+			if a.pathMatch(anc, pattern) {
+				return "deny-list " + raw
 			}
-			if same {
-				return "broad folder " + raw
-			}
 		}
-		if p := a.pathKey(filepath.Dir(candidate)); p == "/users" || p == "/volumes" {
-			return "home or volume root"
-		}
-		for _, id := range ids {
-			if id.ok && protected[id.id] {
-				return "deny-list (same directory as a protected path)"
+		base := pattern
+		for strings.ContainsAny(base, "*?[") {
+			next := filepath.Dir(base)
+			if next == base {
+				break
 			}
+			base = next
 		}
-		for _, raw := range cfg.DenyPaths {
-			pattern := a.expand(raw)
-			for _, anc := range chain {
-				if a.pathMatch(anc, pattern) {
-					return "deny-list " + raw
-				}
-			}
-			base := pattern
-			for strings.ContainsAny(base, "*?[") {
-				next := filepath.Dir(base)
-				if next == base {
+		if a.within(base, path) {
+			return "may contain deny-listed " + raw
+		}
+	}
+	for _, target := range targets {
+		same := a.within(target, path)
+		if cand.ok && !same {
+			for _, p := range ancestors(target) {
+				id, ok := a.Identity(p)
+				if ok && id == cand.id {
+					same = true
 					break
 				}
-				base = next
-			}
-			if a.within(base, candidate) {
-				return "may contain deny-listed " + raw
 			}
 		}
-		for _, target := range targets {
-			same := a.within(target, candidate)
-			if cand.ok && !same {
-				for _, p := range ancestors(target) {
-					id, ok := a.Identity(p)
-					if ok && id == cand.id {
-						same = true
-						break
-					}
-				}
-			}
-			if same {
-				return "contains deny-listed " + target
-			}
+		if same {
+			return "contains deny-listed " + target
 		}
-		parts := pathParts(candidate)
-		for _, p := range parts {
-			if fold(p) == ".git" || fold(p) == ".jj" {
-				return "inside a .git/.jj dir"
-			}
+	}
+	parts := pathParts(path)
+	for _, p := range parts {
+		if fold(p) == ".git" || fold(p) == ".jj" {
+			return "inside a .git/.jj dir"
 		}
-		if hit := denyNameHit(parts, cfg); hit != "" {
-			return "deny-listed name " + hit
-		}
+	}
+	if hit := denyNameHit(parts, cfg); hit != "" {
+		return "deny-listed name " + hit
 	}
 	return ""
 }
@@ -823,7 +810,7 @@ func (a *App) scan(roots []string, cfg *Config, limit float64) (map[string]bool,
 			complete = false
 			return
 		}
-		a.fsBefore("scan-read-dir", folder, ".")
+
 		entries, err := dir.ReadDir(-1)
 		if err != nil {
 			return
@@ -873,14 +860,7 @@ func (a *App) scan(roots []string, cfg *Config, limit float64) (map[string]bool,
 			if err != nil {
 				continue
 			}
-			opened, err := child.Stat()
-			if err == nil && sameIdentity(info, opened) {
-				visit(child, path, depth+1, dev)
-				current, checkErr := a.StatAt(dir, name, false)
-				if checkErr != nil || !sameIdentity(opened, current) {
-					complete = false
-				}
-			}
+			visit(child, path, depth+1, dev)
 			child.Close()
 		}
 	}

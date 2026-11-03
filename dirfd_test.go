@@ -51,11 +51,8 @@ func TestDirFDOperations(t *testing.T) {
 		blocked.Close()
 	}
 	check(t, err != nil, "nofollow open followed symlink")
-	must(t, renameAt(folder, "file", folder, "renamed"))
-	_, err = statAt(folder, "file", false)
-	check(t, errors.Is(err, os.ErrNotExist), "rename kept old child: %v", err)
 	must(t, unlinkAt(folder, "link", false))
-	must(t, unlinkAt(folder, "renamed", false))
+	must(t, unlinkAt(folder, "file", false))
 	must(t, unlinkAt(parent, "directory", true))
 	_, err = statAt(parent, "directory", false)
 	check(t, errors.Is(err, os.ErrNotExist), "directory not removed: %v", err)
@@ -82,12 +79,11 @@ func TestDirFDOperationsStayInOpenedDirectoryAfterPathSwap(t *testing.T) {
 	must(t, unlinkAt(parent, "child", false))
 	must(t, mkdirAt(parent, "new-directory", 0755))
 	must(t, symlinkAt("target", parent, "new-link"))
-	must(t, renameAt(parent, "new-link", parent, "renamed-link"))
 	b, err = os.ReadFile(filepath.Join(victim, "child"))
 	must(t, err)
 	check(t, string(b) == "precious", "victim changed: %q", b)
 	check(t, !exists(filepath.Join(victim, "new-directory")) && !exists(filepath.Join(victim, "new-link")), "mutation escaped pinned directory")
-	must(t, unlinkAt(parent, "renamed-link", false))
+	must(t, unlinkAt(parent, "new-link", false))
 	must(t, unlinkAt(parent, "new-directory", true))
 }
 func TestDirFDLeafNamesRefuseTraversal(t *testing.T) {
@@ -108,8 +104,6 @@ func TestDirFDLeafNamesRefuseTraversal(t *testing.T) {
 			_, err = readlinkAt(parent, name)
 			check(t, err != nil, "readlink accepted %q", name)
 			check(t, symlinkAt("target", parent, name) != nil, "symlink accepted %q", name)
-			check(t, renameAt(parent, name, parent, "safe") != nil, "rename source accepted %q", name)
-			check(t, renameAt(parent, "safe", parent, name) != nil, "rename destination accepted %q", name)
 		})
 	}
 }

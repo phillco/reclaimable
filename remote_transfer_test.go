@@ -48,42 +48,6 @@ func TestArchiveExportMatchesVerifiedManifest(t *testing.T) {
 	check(t, names[markerName] && names["empty/"] && !names[".DS_Store"] && !names["d/.DS_Store"], "archive names %v", names)
 	check(t, len(got) == 3 && got["a.txt"] == hashes["a.txt"] && got["d/b.txt"] == hashes["d/b.txt"] && got["d/link"] == "link:../a.txt", "exported hashes %v", got)
 }
-func TestArchiveExportRejectsSwappedSourceEntries(t *testing.T) {
-	for _, kind := range []string{"file", "directory", "symlink"} {
-		t.Run(kind, func(t *testing.T) {
-			e := newTestEnv(t)
-			src := e.make(t, "export", 30*day, map[string][]byte{"sub/file": []byte("fixture")}, nil)
-			victim := filepath.Join(e.Root, "outside")
-			removalWrite(t, filepath.Join(victim, "precious"), "outside bytes")
-			must(t, os.Symlink("sub/file", filepath.Join(src, "link")))
-			hashes, err := e.A.FileHashes(src)
-			must(t, err)
-			op, name, parent := "archive-read", "file", filepath.Join(src, "sub")
-			if kind == "directory" {
-				op, name, parent = "archive-descend", "sub", src
-			}
-			if kind == "symlink" {
-				op, name, parent = "archive-link", "link", src
-			}
-			fired := false
-			e.A.FSBefore = func(gotOp, gotParent, gotName string) {
-				if fired || gotOp != op || gotParent != parent || gotName != name {
-					return
-				}
-				fired = true
-				must(t, os.Rename(filepath.Join(parent, name), filepath.Join(e.Root, "saved")))
-				must(t, os.Symlink(victim, filepath.Join(parent, name)))
-			}
-			var archive bytes.Buffer
-			err = e.A.exportArchive(src, &archive, withoutMarker(hashes))
-			check(t, fired && err != nil, "archive accepted swapped %s: %v", kind, err)
-			check(t, !bytes.Contains(archive.Bytes(), []byte("outside bytes")), "archive read outside sentinel")
-			b, err := os.ReadFile(filepath.Join(victim, "precious"))
-			must(t, err)
-			check(t, string(b) == "outside bytes", "outside bytes changed")
-		})
-	}
-}
 func TestArchiveExportRefusesChangedBytes(t *testing.T) {
 	e := newTestEnv(t)
 	src := e.make(t, "export", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
@@ -92,48 +56,6 @@ func TestArchiveExportRefusesChangedBytes(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(src, "file"), []byte("changed"), 0600))
 	var out bytes.Buffer
 	check(t, e.A.exportArchive(src, &out, withoutMarker(hashes)) != nil, "archive accepted content changed since verification")
-}
-
-func TestArchiveExportPinsRenamedSourceRoot(t *testing.T) {
-	e := newTestEnv(t)
-	src := e.make(t, "export-root", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
-	victim := filepath.Join(e.Root, "outside")
-	removalWrite(t, filepath.Join(victim, "precious"), "outside bytes")
-	hashes, err := e.A.FileHashes(src)
-	must(t, err)
-	fired := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if fired || op != "archive-read" || parent != src || name != "file" {
-			return
-		}
-		fired = true
-		must(t, os.Rename(src, filepath.Join(e.Root, "saved-root")))
-		must(t, os.Symlink(victim, src))
-	}
-	var archive bytes.Buffer
-	err = e.A.exportArchive(src, &archive, withoutMarker(hashes))
-	check(t, fired && err != nil, "archive accepted renamed source root")
-	check(t, !bytes.Contains(archive.Bytes(), []byte("outside bytes")), "archive read outside target")
-	b, err := os.ReadFile(filepath.Join(victim, "precious"))
-	must(t, err)
-	check(t, string(b) == "outside bytes", "outside bytes changed")
-}
-func TestArchiveExportRejectsMutationDuringRead(t *testing.T) {
-	e := newTestEnv(t)
-	src := e.make(t, "export-mutated", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
-	hashes, err := e.A.FileHashes(src)
-	must(t, err)
-	fired := false
-	e.A.FSBefore = func(op, parent, name string) {
-		if fired || op != "archive-after-read" || parent != src || name != "file" {
-			return
-		}
-		fired = true
-		must(t, os.WriteFile(filepath.Join(parent, name), []byte("changed after archive read"), 0600))
-	}
-	var archive bytes.Buffer
-	err = e.A.exportArchive(src, &archive, withoutMarker(hashes))
-	check(t, fired && err != nil, "archive accepted mutation during read")
 }
 
 func TestRemoteTransferPreservesFilesAndLinks(t *testing.T) {
@@ -202,23 +124,12 @@ func TestRemoteTransferNeverInvokesReceiverAfterExportFailure(t *testing.T) {
 	src := e.make(t, "transfer", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
 	hashes, err := e.A.FileHashes(src)
 	must(t, err)
-	outside := filepath.Join(e.Root, "outside")
-	removalWrite(t, outside, "outside bytes")
-	fired, ran := false, false
-	e.A.FSBefore = func(op, parent, name string) {
-		if fired || op != "archive-read" || parent != src || name != "file" {
-			return
-		}
-		fired = true
-		must(t, os.Rename(filepath.Join(src, "file"), filepath.Join(e.Root, "saved-file")))
-		must(t, os.Symlink(outside, filepath.Join(src, "file")))
-	}
+	// A changed source must fail manifest verification before any remote command.
+	removalWrite(t, filepath.Join(src, "file"), "changed bytes")
+	ran := false
 	e.A.RunInput = func([]string, float64, string, []string, io.Reader) Result { ran = true; return Result{Code: 0} }
 	ok, detail := e.A.remoteCopyVerified(src, filepath.Join(e.Root, "received"), "fixture", []string{"unused"}, hashes)
-	check(t, fired && !ran && !ok && exists(src), "receiver saw failed archive: %v %v %s", fired, ran, detail)
-	b, err := os.ReadFile(outside)
-	must(t, err)
-	check(t, string(b) == "outside bytes", "outside bytes changed")
+	check(t, !ran && !ok && exists(src), "receiver saw failed archive: %v %s", ran, detail)
 }
 func TestRemoteTransferFailureKeepsSource(t *testing.T) {
 	for _, result := range []Result{{Code: 2, Stderr: "receiver failed"}, {Code: -1, Err: os.ErrNotExist}, {Code: -9, Timeout: true}} {

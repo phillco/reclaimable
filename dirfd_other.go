@@ -20,6 +20,3 @@ func unlinkAt(parent *os.File, name string, dir bool) error       { return unsup
 func readlinkAt(parent *os.File, name string) (string, error)     { return "", unsupportedAt() }
 func mkdirAt(parent *os.File, name string, mode uint32) error     { return unsupportedAt() }
 func symlinkAt(target string, parent *os.File, name string) error { return unsupportedAt() }
-func renameAt(oldParent *os.File, oldName string, newParent *os.File, newName string) error {
-	return unsupportedAt()
-}

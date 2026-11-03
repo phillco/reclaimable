@@ -108,29 +108,3 @@ func symlinkAt(target string, parent *os.File, name string) error {
 	}
 	return nil
 }
-func renameAt(oldParent *os.File, oldName string, newParent *os.File, newName string) error {
-	old, err := atName(oldName)
-	if err != nil {
-		return err
-	}
-	next, err := atName(newName)
-	if err != nil {
-		return err
-	}
-	// Linux UAPI: renameat2 is 316 on amd64, 276 on arm64; RENAME_NOREPLACE is 1.
-	// An unavailable syscall or filesystem flag fails closed, without a fallback.
-	number := uintptr(316)
-	if runtime.GOARCH == "arm64" {
-		number = 276
-	}
-	const renameNoReplace = 1
-	_, _, e := syscall.Syscall6(number, oldParent.Fd(), uintptr(unsafe.Pointer(old)), newParent.Fd(), uintptr(unsafe.Pointer(next)), renameNoReplace, 0)
-	runtime.KeepAlive(oldParent)
-	runtime.KeepAlive(newParent)
-	runtime.KeepAlive(old)
-	runtime.KeepAlive(next)
-	if e != 0 {
-		return &os.LinkError{Op: "renameat2", Old: oldName, New: newName, Err: e}
-	}
-	return nil
-}

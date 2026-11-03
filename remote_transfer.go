@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 	"unicode/utf8"
 )
 
@@ -23,185 +22,48 @@ func (a *App) exportArchive(root string, w io.Writer, expected map[string]string
 		return err
 	}
 	defer source.Close()
-	info, err := source.Stat()
-	if err != nil {
-		return err
-	}
-	if err = refuseExtendedDataFD(source); err != nil {
-		return err
-	}
 	manifest := map[string]string{}
 	tw := tar.NewWriter(w)
-	var visit func(*os.File, string, string) error
-	visit = func(parent *os.File, parentPath, relative string) error {
-		entries, err := parent.ReadDir(-1)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			if name == ".DS_Store" {
-				continue
-			}
-			st, err := statAt(parent, name, false)
+	err = a.walkPayload(source, func(parent, file *os.File, name, relative string, st os.FileInfo) error {
+		link := ""
+		if st.Mode()&os.ModeSymlink != 0 {
+			var err error
+			link, err = readlinkAt(parent, name)
 			if err != nil {
 				return err
 			}
-			rel := filepath.Join(relative, name)
-			logical := filepath.Join(parentPath, name)
-			switch {
-			case st.IsDir():
-				if device(st) != device(info) {
-					return fmt.Errorf("archive contains another filesystem at %s", logical)
-				}
-				a.fsBefore("archive-descend", parentPath, name)
-				child, err := openCopyDir(parent, name, st)
-				if err != nil {
-					return err
-				}
-				err = func() error {
-					defer child.Close()
-					if err := refuseExtendedDataFD(child); err != nil {
-						return err
-					}
-					header, err := tar.FileInfoHeader(st, "")
-					if err != nil {
-						return err
-					}
-					header.Name = filepath.ToSlash(rel) + "/"
-					header.AccessTime = accessTime(st)
-					header.Format = tar.FormatPAX
-					if err = tw.WriteHeader(header); err != nil {
-						return err
-					}
-					if err = visit(child, logical, rel); err != nil {
-						return err
-					}
-					return verifyCopyLeaf(parent, name, child)
-				}()
-				if err != nil {
-					return err
-				}
-			case st.Mode()&os.ModeSymlink != 0:
-				a.fsBefore("archive-link", parentPath, name)
-				pinned, err := pinSymlinkAt(parent, name)
-				if err != nil {
-					return err
-				}
-				err = func() error {
-					defer pinned.Close()
-					got, err := pinned.Stat()
-					if err != nil {
-						return err
-					}
-					if !sameIdentity(got, st) {
-						return fmt.Errorf("symlink changed during archive export")
-					}
-					if err = refuseSymlinkExtendedDataAt(parent, name, pinned); err != nil {
-						return err
-					}
-					link, err := readlinkAt(parent, name)
-					if err != nil {
-						return err
-					}
-					if err = verifyCopyLeaf(parent, name, pinned); err != nil {
-						return err
-					}
-					header, err := tar.FileInfoHeader(st, link)
-					if err != nil {
-						return err
-					}
-					header.Name = filepath.ToSlash(rel)
-					header.AccessTime = accessTime(st)
-					header.Format = tar.FormatPAX
-					if err = tw.WriteHeader(header); err != nil {
-						return err
-					}
-					if rel != markerName {
-						manifest[filepath.ToSlash(rel)] = "link:" + link
-					}
-					return nil
-				}()
-				if err != nil {
-					return err
-				}
-			case st.Mode().IsRegular():
-				a.fsBefore("archive-read", parentPath, name)
-				in, err := openAt(parent, name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
-				if err != nil {
-					return err
-				}
-				err = func() error {
-					defer in.Close()
-					opened, err := in.Stat()
-					if err != nil {
-						return err
-					}
-					if !opened.Mode().IsRegular() || !sameIdentity(opened, st) {
-						return fmt.Errorf("file changed during archive export")
-					}
-					if err = refuseExtendedDataFD(in); err != nil {
-						return err
-					}
-					header, err := tar.FileInfoHeader(st, "")
-					if err != nil {
-						return err
-					}
-					header.Name = filepath.ToSlash(rel)
-					header.AccessTime = accessTime(st)
-					header.Format = tar.FormatPAX
-					if err = tw.WriteHeader(header); err != nil {
-						return err
-					}
-					hash := sha256.New()
-					if _, err = io.CopyN(tw, io.TeeReader(in, hash), st.Size()); err != nil {
-						return err
-					}
-					a.fsBefore("archive-after-read", parentPath, name)
-					after, err := in.Stat()
-					if err != nil {
-						return err
-					}
-					if !unchangedFile(after, opened) {
-						return fmt.Errorf("file changed during archive export")
-					}
-					if err = verifyCopyLeaf(parent, name, in); err != nil {
-						return err
-					}
-					if rel != markerName {
-						manifest[filepath.ToSlash(rel)] = fmt.Sprintf("%x", hash.Sum(nil))
-					}
-					return nil
-				}()
-				if err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("cannot archive special file %s", logical)
+			manifest[filepath.ToSlash(relative)] = "link:" + link
+		}
+		header, err := tar.FileInfoHeader(st, link)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(relative)
+		if st.IsDir() {
+			header.Name += "/"
+		}
+		header.AccessTime = accessTime(st)
+		header.Format = tar.FormatPAX
+		if err = tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if st.Mode().IsRegular() {
+			hash := sha256.New()
+			if _, err = io.CopyN(tw, io.TeeReader(file, hash), st.Size()); err != nil {
+				return err
 			}
+			manifest[filepath.ToSlash(relative)] = fmt.Sprintf("%x", hash.Sum(nil))
 		}
 		return nil
-	}
-	if err = visit(source, root, ""); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if err = tw.Close(); err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(manifest, withoutMarker(expected)) {
+	if !reflect.DeepEqual(withoutMarker(manifest), withoutMarker(expected)) {
 		return fmt.Errorf("source changed during archive export")
-	}
-	fresh, err := openPathDir(root)
-	if err != nil {
-		return err
-	}
-	defer fresh.Close()
-	current, err := fresh.Stat()
-	if err != nil {
-		return err
-	}
-	if !sameIdentity(current, info) {
-		return fmt.Errorf("source root changed during archive export")
 	}
 	return nil
 }
