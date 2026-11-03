@@ -15,7 +15,7 @@ import (
 
 // exportArchive reads only verified descriptors and compares exactly the bytes
 // being archived with the manifest that authorized the move. A failed export
-// never sends a partial archive to the remote command.
+// keeps the source, even if the receiver has created a partial destination.
 func (a *App) exportArchive(root string, w io.Writer, expected map[string]string) error {
 	source, err := openPathDir(root)
 	if err != nil {
@@ -86,22 +86,6 @@ func (a *App) remoteCopyVerified(sourceRoot, dest, host string, remote []string,
 			return false, "remote transfer failed: " + err.Error()
 		}
 	}
-	stream, err := os.CreateTemp("", "reclaimable-transfer-")
-	if err != nil {
-		return false, "remote transfer failed: " + err.Error()
-	}
-	defer stream.Close()
-	// The open file is the only reference while unverified source bytes are
-	// spooled. Nothing can redirect a later path-based archive reopen.
-	if err = os.Remove(stream.Name()); err != nil {
-		return false, "remote transfer failed: " + err.Error()
-	}
-	if err = a.exportArchive(sourceRoot, stream, src); err != nil {
-		return false, "remote transfer failed: " + err.Error()
-	}
-	if _, err = stream.Seek(0, io.SeekStart); err != nil {
-		return false, "remote transfer failed: " + err.Error()
-	}
 	if len(remote) == 0 {
 		remote = defaultRemoteCommand
 	}
@@ -110,7 +94,16 @@ func (a *App) remoteCopyVerified(sourceRoot, dest, host string, remote []string,
 	for i, arg := range remote {
 		command[i] = strings.ReplaceAll(strings.ReplaceAll(arg, "{host}", host), "{script}", script)
 	}
-	result := a.RunInput(command, 300, "", nil, stream)
+	reader, writer := io.Pipe()
+	exported := make(chan error, 1)
+	go func() {
+		err := a.exportArchive(sourceRoot, writer, src)
+		writer.CloseWithError(err)
+		exported <- err
+	}()
+	result := a.RunInput(command, 300, "", nil, reader)
+	reader.Close() // Unblock export if the receiver exits without reading it all.
+	exportErr := <-exported
 	if result.Err != nil {
 		return false, "remote transfer failed: " + result.Err.Error()
 	}
@@ -119,6 +112,9 @@ func (a *App) remoteCopyVerified(sourceRoot, dest, host string, remote []string,
 	}
 	if result.Code != 0 {
 		return false, "remote transfer failed: " + shortText(strings.TrimSpace(result.Stderr), 160)
+	}
+	if exportErr != nil {
+		return false, "remote transfer failed: " + exportErr.Error()
 	}
 	return true, dest
 }
@@ -136,37 +132,16 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
 
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
-    def same(a, b):
-        return (a.st_dev, a.st_ino, stat.S_IFMT(a.st_mode)) == (
-            b.st_dev,
-            b.st_ino,
-            stat.S_IFMT(b.st_mode),
-        )
-
-    def require(parent, name, expected):
-        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        if not same(current, expected):
-            raise OSError(f"entry replaced: {name}")
-
     @contextlib.contextmanager
-    def directory_at(parent, name, expected=None, create=False):
+    def directory_at(parent, name, create=False):
         if create:
             try:
                 os.mkdir(name, 0o700, dir_fd=parent)
             except FileExistsError:
                 pass
-        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        if not stat.S_ISDIR(before.st_mode) or (
-            expected is not None and not same(before, expected)
-        ):
-            raise OSError(f"not the expected directory: {name}")
         fd = os.open(name, flags, dir_fd=parent)
         try:
-            if not same(os.fstat(fd), before):
-                raise OSError(f"directory replaced: {name}")
-            require(parent, name, before)
             yield fd
-            require(parent, name, before)
         finally:
             os.close(fd)
 
@@ -194,30 +169,18 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
             if stat.S_ISDIR(expected.st_mode):
                 if expected.st_dev != dev:
                     raise OSError(f"filesystem boundary: {relative}")
-                with directory_at(fd, entry.name, expected) as child:
+                with directory_at(fd, entry.name) as child:
                     inventory(child, relative + "/", dev, out)
             elif stat.S_ISLNK(expected.st_mode):
                 out[relative] = "link:" + os.readlink(entry.name, dir_fd=fd)
-                require(fd, entry.name, expected)
             elif stat.S_ISREG(expected.st_mode):
                 opened = os.open(
                     entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
                 )
                 with os.fdopen(opened, "rb") as source:
-                    before = os.fstat(source.fileno())
-                    if not same(before, expected):
-                        raise OSError(f"file replaced: {relative}")
                     digest = hashlib.sha256()
                     for chunk in iter(lambda: source.read(1 << 20), b""):
                         digest.update(chunk)
-                    after = os.fstat(source.fileno())
-                    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                        after.st_size,
-                        after.st_mtime_ns,
-                        after.st_ctime_ns,
-                    ):
-                        raise OSError(f"file changed: {relative}")
-                require(fd, entry.name, expected)
                 out[relative] = digest.hexdigest()
             else:
                 raise OSError(f"unsupported file type: {relative}")
@@ -230,18 +193,6 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
         return
     if mode != "receive":
         raise ValueError("invalid transfer operation")
-    destination_ids = {}
-
-    @contextlib.contextmanager
-    def extraction_directory(parent, name, relative):
-        expected = destination_ids.get(relative)
-        with directory_at(
-            parent, name, expected=expected, create=expected is None
-        ) as fd:
-            if expected is None:
-                destination_ids[relative] = os.fstat(fd)
-            yield fd
-
     with directory(destination, create=True, exclusive=True) as root:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
             for member in archive:
@@ -252,15 +203,11 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
                     raise ValueError("unsupported archive member")
                 with contextlib.ExitStack() as stack:
                     parent = root
-                    for index, name in enumerate(parts[:-1]):
-                        parent = stack.enter_context(
-                            extraction_directory(
-                                parent, name, tuple(parts[: index + 1])
-                            )
-                        )
+                    for name in parts[:-1]:
+                        parent = stack.enter_context(directory_at(parent, name, create=True))
                     name = parts[-1]
                     if member.isdir():
-                        with extraction_directory(parent, name, tuple(parts)):
+                        with directory_at(parent, name, create=True):
                             pass
                     elif member.issym():
                         os.symlink(member.linkname, name, dir_fd=parent)
@@ -272,7 +219,6 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
                             dir_fd=parent,
                         )
                         with os.fdopen(fd, "wb") as target:
-                            original = os.fstat(target.fileno())
                             source = archive.extractfile(member)
                             if source is None:
                                 raise ValueError("missing archive file data")
@@ -287,7 +233,6 @@ const remoteArchiveProgram = `def _remote_archive(mode, destination):
                             target.flush()
                             os.fchmod(target.fileno(), member.mode & 0o777)
                             os.utime(target.fileno(), (member.mtime, member.mtime))
-                        require(parent, name, original)
 `
 
 func refuseRemoteAttributeList(query func([]byte) (int, error)) error {

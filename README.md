@@ -450,9 +450,9 @@ and free-space measurements are normalized.
 - Local copies retain full mode bits/macOS flags beyond the updated Python copy's
   ordinary permission bits. Both refuse unverifiable extended payloads, including
   resource forks, except system provenance.
-- Remote export uses verified TAR in an unlinked temporary descriptor; Python
-  first builds a private snapshot tree. Both use the same descriptor-safe receiver
-  and JSON inventory; malformed/duplicate inventories are refused.
+- Remote export streams verified TAR without staging a full local archive; Python
+  first builds a private snapshot tree. Both use descriptor-relative receivers
+  and JSON inventories; malformed/duplicate inventories are refused.
 - The unreadable-claim test isolates claims from an earlier live lease, fixing a
   masking assertion while preserving its intended scenario.
 

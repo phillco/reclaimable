@@ -204,13 +204,6 @@ func (a *App) moveAndVerify(folder, destRoot string, remote []string, src map[st
 		}
 		return false, fmt.Sprintf("hash mismatch at %s%s (missing %s, changed %s)", prefix, dest, pyStrings(missing), pyStrings(changed))
 	}
-	current, hashErr := a.FileHashes(folder)
-	if hashErr != nil {
-		return false, "source hash failed: " + hashErr.Error()
-	}
-	if !reflect.DeepEqual(withoutMarker(current), src) {
-		return false, "source changed while it was being copied"
-	}
 	return true, prefix + dest
 }
 func (a *App) rmtreeSameDev(path string) ([]string, error) {

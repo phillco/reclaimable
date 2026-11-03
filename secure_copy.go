@@ -23,9 +23,6 @@ func (a *App) copyTreePinned(src, dest string) (target *os.File, err error) {
 		return nil, err
 	}
 	defer source.Close()
-	if err = refuseExtendedDataFD(source); err != nil {
-		return nil, err
-	}
 	sourceInfo, err := source.Stat()
 	if err != nil {
 		return nil, err

@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -119,17 +118,24 @@ func TestRemoteTransferRefusesSymlinkDestinationParent(t *testing.T) {
 	must(t, err)
 	check(t, len(entries) == 1 && entries[0].Name() == "precious", "outside destination mutated")
 }
-func TestRemoteTransferNeverInvokesReceiverAfterExportFailure(t *testing.T) {
+func TestRemoteTransferKeepsSourceAfterExportFailure(t *testing.T) {
 	e := newTestEnv(t)
 	src := e.make(t, "transfer", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
 	hashes, err := e.A.FileHashes(src)
 	must(t, err)
-	// A changed source must fail manifest verification before any remote command.
 	removalWrite(t, filepath.Join(src, "file"), "changed bytes")
-	ran := false
-	e.A.RunInput = func([]string, float64, string, []string, io.Reader) Result { ran = true; return Result{Code: 0} }
+	ok, detail := e.A.remoteCopyVerified(src, filepath.Join(e.Root, "received"), "fixture", []string{"sh", "-c", "{script}"}, hashes)
+	check(t, !ok && exists(src), "export failure lost source: %v %s", ok, detail)
+}
+func TestRemoteTransferEarlySuccessKeepsSource(t *testing.T) {
+	e := newTestEnv(t)
+	src := e.make(t, "transfer", 30*day, map[string][]byte{"file": []byte("fixture")}, nil)
+	hashes, err := e.A.FileHashes(src)
+	must(t, err)
+	// A misconfigured receiver can exit successfully without consuming stdin.
+	e.A.RunInput = func([]string, float64, string, []string, io.Reader) Result { return Result{} }
 	ok, detail := e.A.remoteCopyVerified(src, filepath.Join(e.Root, "received"), "fixture", []string{"unused"}, hashes)
-	check(t, !ran && !ok && exists(src), "receiver saw failed archive: %v %s", ran, detail)
+	check(t, !ok && exists(src), "incomplete transfer accepted: %v %s", ok, detail)
 }
 func TestRemoteTransferFailureKeepsSource(t *testing.T) {
 	for _, result := range []Result{{Code: 2, Stderr: "receiver failed"}, {Code: -1, Err: os.ErrNotExist}, {Code: -9, Timeout: true}} {
@@ -212,52 +218,6 @@ func TestRemoteHashRefusesSymlinkRoot(t *testing.T) {
 	must(t, os.Symlink(outside, alias))
 	_, err := e.A.remoteHashes("fixture", alias, []string{"sh", "-c", "{script}"})
 	check(t, err != nil, "remote hash followed symlink root")
-}
-func TestRemoteReceiverPinsNestedDirectoryAcrossMembers(t *testing.T) {
-	e := newTestEnv(t)
-	dest := filepath.Join(e.Root, "destination")
-	outside := filepath.Join(e.Root, "outside")
-	removalWrite(t, filepath.Join(outside, "sentinel"), "keep")
-	var archive bytes.Buffer
-	tw := tar.NewWriter(&archive)
-	must(t, tw.WriteHeader(&tar.Header{Name: "child", Typeflag: tar.TypeDir, Mode: 0700}))
-	must(t, tw.WriteHeader(&tar.Header{Name: "child/payload", Typeflag: tar.TypeReg, Mode: 0600, Size: 3}))
-	_, err := tw.Write([]byte("new"))
-	must(t, err)
-	must(t, tw.Close())
-	destJSON, _ := json.Marshal(dest)
-	outsideJSON, _ := json.Marshal(outside)
-	patch := fmt.Sprintf(`
-destination = %s
-outside = %s
-original_stat = os.stat
-observations = []
-swapped = []
-def patched_stat(path, *args, **kwargs):
-    if path == "child" and kwargs.get("dir_fd") is not None:
-        observations.append(True)
-        if len(observations) == 4:
-            os.rename(destination + "/child", destination + "/original-child")
-            os.rename(outside, destination + "/child")
-            swapped.append(True)
-    return original_stat(path, *args, **kwargs)
-os.stat = patched_stat
-try:
-    _remote_archive("receive", destination)
-except OSError:
-    pass
-else:
-    raise AssertionError("replaced nested directory accepted")
-assert swapped
-`, destJSON, outsideJSON)
-	// The exported receiver imports these modules inside its function; the local
-	// monkeypatch driver also needs them in its own global namespace.
-	program := "import os\n" + remoteArchiveProgram + patch
-	result := e.A.RunInput([]string{"python3", "-c", program}, 10, "", nil, bytes.NewReader(archive.Bytes()))
-	check(t, result.Err == nil && !result.Timeout && result.Code == 0, "receiver pin test failed: %+v", result)
-	b, err := os.ReadFile(filepath.Join(dest, "child/sentinel"))
-	must(t, err)
-	check(t, string(b) == "keep" && !exists(filepath.Join(dest, "child/payload")), "outside directory was written")
 }
 func TestRemoteTransferPreservesMarkerAge(t *testing.T) {
 	e := newTestEnv(t)

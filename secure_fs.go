@@ -92,8 +92,10 @@ func (a *App) walkPayload(root *os.File, visit func(*os.File, *os.File, string, 
 					if err := refuseSymlinkExtendedDataAt(dir, name, child); err != nil {
 						return err
 					}
-				} else if err := refuseExtendedDataFD(child); err != nil {
-					return err
+				} else if st.Mode().IsRegular() {
+					if err := refuseExtendedDataFD(child); err != nil {
+						return err
+					}
 				}
 				if err := visit(dir, child, name, rel, st); err != nil {
 					return err
